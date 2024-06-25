@@ -1,5 +1,6 @@
 import type { TypedStartListening } from '@reduxjs/toolkit';
 import { createListenerMiddleware } from '@reduxjs/toolkit';
+import { addStagingListeners } from 'app/store/middleware/listenerMiddleware/listeners/addCommitStagingAreaImageListener';
 import { addFirstListImagesListener } from 'app/store/middleware/listenerMiddleware/listeners/addFirstListImagesListener.ts';
 import { addAnyEnqueuedListener } from 'app/store/middleware/listenerMiddleware/listeners/anyEnqueued';
 import { addAppConfigReceivedListener } from 'app/store/middleware/listenerMiddleware/listeners/appConfigReceived';
@@ -82,6 +83,7 @@ addBatchEnqueuedListener(startAppListening);
 // addCanvasMergedListener(startAppListening);
 // addStagingAreaImageSavedListener(startAppListening);
 // addCommitStagingAreaImageListener(startAppListening);
+addStagingListeners(startAppListening);
 
 // Socket.IO
 addGeneratorProgressEventListener(startAppListening);
