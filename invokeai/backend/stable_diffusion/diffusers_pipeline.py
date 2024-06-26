@@ -22,10 +22,18 @@ from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 from invokeai.app.services.config.config_default import get_config
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import IPAdapterData, TextConditioningData
 from invokeai.backend.stable_diffusion.diffusion.shared_invokeai_diffusion import InvokeAIDiffuserComponent
-from invokeai.backend.stable_diffusion.diffusion.unet_attention_patcher import UNetAttentionPatcher, UNetIPAdapterData
+from invokeai.backend.stable_diffusion.diffusion.unet_attention_patcher import UNetAttentionPatcher, UNetAttentionPatcher_new, UNetIPAdapterData
+from invokeai.backend.stable_diffusion.diffusion.addons.controlnet import ControlNetAddon
+from invokeai.backend.stable_diffusion.diffusion.addons.ip_adapter import IPAdapterAddon
+from invokeai.backend.stable_diffusion.diffusion.addons.t2i_adapter import T2IAdapterAddon
+from invokeai.backend.stable_diffusion.diffusion.addons.inpaint_model import InpaintModelAddon
 from invokeai.backend.util.attention import auto_detect_slice_size
 from invokeai.backend.util.devices import TorchDevice
 from invokeai.backend.util.hotfixes import ControlNetModel
+
+
+from tqdm.auto import tqdm
+from invokeai.backend.stable_diffusion.diffusion.regional_ip_data import RegionalIPData
 
 
 @dataclass
@@ -282,6 +290,24 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
         masked_latents: Optional[torch.Tensor] = None,
         is_gradient_mask: bool = False,
     ) -> torch.Tensor:
+        if True:
+            new_back = StableDiffusionBackend(self.unet, self.scheduler)
+            return new_back.latents_from_embeddings(
+                latents=latents,
+                scheduler_step_kwargs=scheduler_step_kwargs,
+                conditioning_data=conditioning_data,
+                noise=noise,
+                timesteps=timesteps,
+                init_timestep=init_timestep,
+                callback=callback,
+                control_data=control_data,
+                ip_adapter_data=ip_adapter_data,
+                t2i_adapter_data=t2i_adapter_data,
+                mask=mask,
+                masked_latents=masked_latents,
+                is_gradient_mask=is_gradient_mask,
+                seed=seed,
+            )
         """Denoise the latents.
 
         Args:
@@ -575,18 +601,475 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
 
     def _unet_forward(
         self,
-        latents,
-        t,
-        text_embeddings,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        encoder_hidden_states: torch.Tensor,
         cross_attention_kwargs: Optional[dict[str, Any]] = None,
         **kwargs,
     ):
         """predict the noise residual"""
         # First three args should be positional, not keywords, so torch hooks can see them.
         return self.unet(
-            latents,
-            t,
-            text_embeddings,
+            sample,
+            timestep,
+            encoder_hidden_states,
+            cross_attention_kwargs=cross_attention_kwargs,
+            **kwargs,
+        ).sample
+
+
+class StableDiffusionBackend:
+
+    def __init__(self, unet, scheduler):
+        self.unet = unet
+        self.scheduler = scheduler
+        self.sequential_guidance = False # TODO:
+
+    def latents_from_embeddings(
+        self,
+        latents: torch.Tensor,
+        scheduler_step_kwargs: dict[str, Any],
+        conditioning_data: TextConditioningData,
+        noise: Optional[torch.Tensor],
+        seed: int,
+        timesteps: torch.Tensor,
+        init_timestep: torch.Tensor,
+        callback: Callable[[PipelineIntermediateState], None],
+        control_data: list[ControlNetData] | None = None,
+        ip_adapter_data: Optional[list[IPAdapterData]] = None, #
+        t2i_adapter_data: Optional[list[T2IAdapterData]] = None, #
+        mask: Optional[torch.Tensor] = None,
+        masked_latents: Optional[torch.Tensor] = None,
+        is_gradient_mask: bool = False,
+    ) -> torch.Tensor:
+
+        addons = []
+
+        if control_data is not None:
+            for cn_info in control_data:
+                addons.append(
+                    ControlNetAddon(
+                        model=cn_info.model,
+                        image_tensor=cn_info.image_tensor,
+                        weight=cn_info.weight,
+                        begin_step_percent=cn_info.begin_step_percent,
+                        end_step_percent=cn_info.end_step_percent,
+                        control_mode=cn_info.control_mode,
+                        resize_mode=cn_info.resize_mode, #?
+                    )
+                )
+
+        if ip_adapter_data is not None:
+            for ip_info in ip_adapter_data:
+                addons.append(
+                    IPAdapterAddon(
+                        model=ip_info.ip_adapter_model,
+                        conditioning=ip_info.ip_adapter_conditioning,
+                        mask=ip_info.mask,
+                        target_blocks=ip_info.target_blocks,
+                        weight=ip_info.weight,
+                        begin_step_percent=ip_info.begin_step_percent,
+                        end_step_percent=ip_info.end_step_percent,
+                    )
+                )
+
+        if t2i_adapter_data is not None:
+            for t2i_info in t2i_adapter_data:
+                addons.append(
+                    T2IAdapterAddon(
+                        adapter_state=t2i_info.adapter_state,
+                        weight=t2i_info.weight,
+                        begin_step_percent=t2i_info.begin_step_percent,
+                        end_step_percent=t2i_info.end_step_percent,
+                    )
+                )
+
+        return self.latents_from_embeddings2(
+            latents=latents,
+            scheduler_step_kwargs=scheduler_step_kwargs,
+            conditioning_data=conditioning_data,
+            noise=noise,
+            seed=seed,
+            timesteps=timesteps,
+            init_timestep=init_timestep,
+            callback=callback,
+            mask=mask,
+            masked_latents=masked_latents,
+            is_gradient_mask=is_gradient_mask,
+            addons=addons,
+        )
+
+
+    def latents_from_embeddings2(
+        self,
+        latents: torch.Tensor,
+        scheduler_step_kwargs: Dict[str, Any],
+        conditioning_data: TextConditioningData,
+        noise: Optional[torch.Tensor],
+        seed: int,
+        timesteps: torch.Tensor,
+        init_timestep: torch.Tensor,
+        callback: Callable[[PipelineIntermediateState], None],
+        mask: Optional[torch.Tensor] = None,
+        masked_latents: Optional[torch.Tensor] = None,
+        gradient_mask: bool = False,
+        addons: List = [],
+    ) -> torch.Tensor:
+
+        if init_timestep.shape[0] == 0:
+            return latents
+
+        orig_latents = latents.clone()
+        batch_size = latents.shape[0]
+
+        if noise is not None:
+            # latents = noise * self.scheduler.init_noise_sigma # it's like in t2l according to diffusers
+            latents = self.scheduler.add_noise(latents, noise, init_timestep.expand(batch_size))
+
+        # if no work to do, return latents
+        if timesteps.shape[0] == 0:
+            return latents
+
+
+        # inpaint 
+
+        inpaint_helper = None
+
+        # if inpaint model used
+        if is_inpainting_model(self.unet):
+            if mask is not None and masked_latents is None:
+                raise Exception("Source image required for inpaint mask when inpaint model used!")
+            addons.append(InpaintModelAddon(mask=mask, masked_latents=masked_latents))
+        
+        # is normal model used for inpaint
+        elif mask is not None:
+            # if no noise provided, noisify unmasked area based on seed
+            if noise is None:
+                noise = torch.randn(
+                    orig_latents.shape,
+                    dtype=torch.float32,
+                    device="cpu",
+                    generator=torch.Generator(device="cpu").manual_seed(seed),
+                ).to(device=orig_latents.device, dtype=orig_latents.dtype)
+
+            inpaint_helper = AddsMaskGuidance(mask, orig_latents, self.scheduler, noise, gradient_mask)
+
+
+
+
+        # moved to attention patcher
+        #self._adjust_memory_efficient_attention(latents)
+        #if use_ip_adapter or use_regional_prompting:
+        #    ip_adapters: Optional[List[UNetIPAdapterData]] = (
+        #        [dict(ip_adapter=ipa.ip_adapter_model, target_blocks=ipa.target_blocks) for ipa in ip_adapter_data]
+        #        if use_ip_adapter
+        #        else None
+        #    )
+        #    unet_attention_patcher = UNetAttentionPatcher(ip_adapters)
+        #    attn_ctx = unet_attention_patcher.apply_ip_adapter_attention(self.unet)
+
+        with UNetAttentionPatcher_new(self.unet, addons):
+            callback(
+                PipelineIntermediateState(
+                    step=-1,
+                    order=self.scheduler.order,
+                    total_steps=len(timesteps),
+                    timestep=self.scheduler.config.num_train_timesteps,
+                    latents=latents,
+                )
+            )
+
+            for step_index, timestep in enumerate(self.progress_bar(timesteps)):
+                if inpaint_helper is not None:
+                    latents = inpaint_helper.apply_mask(latents, timestep)
+
+                #batched_t = t.expand(batch_size) TODO:
+                step_output = self.step(
+                    timestep,
+                    latents,
+                    conditioning_data,
+                    step_index=step_index,
+                    total_steps=len(timesteps),
+                    scheduler_step_kwargs=scheduler_step_kwargs,
+                    addons=addons,
+                )
+
+                latents = step_output.prev_sample
+                if hasattr(step_output, "denoised"):
+                    predicted_original = step_output.denoised
+                else:
+                    predicted_original = getattr(step_output, "pred_original_sample", latents)
+
+                if inpaint_helper is not None:
+                    # TODO: or timesteps[-1]
+                    predicted_original = inpaint_helper.apply_mask(predicted_original, self.scheduler.timesteps[-1])
+
+                callback(
+                    PipelineIntermediateState(
+                        step=step_index,
+                        order=self.scheduler.order,
+                        total_steps=len(timesteps),
+                        timestep=int(timestep),
+                        latents=latents,
+                        predicted_original=predicted_original,
+                    )
+                )
+
+        # restore unmasked part after the last step is completed
+        # in-process masking happens before each step
+        if mask is not None:
+            if gradient_mask:
+                latents = torch.where(mask > 0, latents, orig_latents)
+            else:
+                latents = torch.lerp(
+                    orig_latents, latents.to(dtype=orig_latents.dtype), mask.to(dtype=orig_latents.dtype)
+                )
+
+        return latents
+
+    # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/pipeline_utils.py#L1624
+    def progress_bar(self, iterable=None, total=None):
+        if not hasattr(self, "_progress_bar_config"):
+            self._progress_bar_config = {}
+        elif not isinstance(self._progress_bar_config, dict):
+            raise ValueError(
+                f"`self._progress_bar_config` should be of type `dict`, but is {type(self._progress_bar_config)}."
+            )
+
+        if iterable is not None:
+            return tqdm(iterable, **self._progress_bar_config)
+        elif total is not None:
+            return tqdm(total=total, **self._progress_bar_config)
+        else:
+            raise ValueError("Either `total` or `iterable` has to be defined.")
+
+
+    @torch.inference_mode()
+    def step(
+        self,
+        timestep: torch.Tensor,
+        latents: torch.Tensor,
+        conditioning_data: TextConditioningData,
+        step_index: int,
+        total_steps: int,
+        scheduler_step_kwargs: dict[str, Any],
+        addons: List,
+    ):
+
+        latent_model_input = self.scheduler.scale_model_input(latents, timestep)
+
+        if self.sequential_guidance:
+            negative_noise_pred, positive_noise_pred = self._apply_standard_conditioning_sequentially(
+                sample=latent_model_input,
+                timestep=timestep,
+                step_index=step_index,
+                total_steps=total_steps,
+                conditioning_data=conditioning_data,
+                addons=addons,
+            )
+        else:
+            negative_noise_pred, positive_noise_pred = self._apply_standard_conditioning(
+                sample=latent_model_input,
+                timestep=timestep,
+                step_index=step_index,
+                total_steps=total_steps,
+                conditioning_data=conditioning_data,
+                addons=addons,
+            )
+
+
+        # prompt mix algo
+        guidance_scale = conditioning_data.guidance_scale
+        if isinstance(guidance_scale, list):
+            guidance_scale = guidance_scale[step_index]
+
+        # lol, is this just lerp?
+        # out = start + weight * (end - start)
+        # noise_pred = torch.lerp(negative_noise_pred, positive_noise_pred, guidance_scale)
+        noise_pred = negative_noise_pred + guidance_scale * (positive_noise_pred - negative_noise_pred)
+        
+
+        # cfg rescale
+        guidance_rescale_multiplier = conditioning_data.guidance_rescale_multiplier
+        if guidance_rescale_multiplier > 0:
+            noise_pred = self._rescale_cfg(
+                noise_pred,
+                positive_noise_pred,
+                guidance_rescale_multiplier,
+            )
+
+        # compute the previous noisy sample x_t -> x_t-1
+        return self.scheduler.step(noise_pred, timestep, latents, **scheduler_step_kwargs)
+
+    @staticmethod
+    def _rescale_cfg(total_noise_pred, pos_noise_pred, multiplier=0.7):
+        """Implementation of Algorithm 2 from https://arxiv.org/pdf/2305.08891.pdf."""
+        ro_pos = torch.std(pos_noise_pred, dim=(1, 2, 3), keepdim=True)
+        ro_cfg = torch.std(total_noise_pred, dim=(1, 2, 3), keepdim=True)
+
+        x_rescaled = total_noise_pred * (ro_pos / ro_cfg)
+        x_final = multiplier * x_rescaled + (1.0 - multiplier) * total_noise_pred
+        return x_final
+
+    def _apply_standard_conditioning(
+        self,
+        sample: torch.Tensor,
+        timestep: torch.Tensor,
+        conditioning_data: TextConditioningData,
+        step_index: int,
+        total_steps: int,
+        addons: List,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Runs the conditioned and unconditioned UNet forward passes in a single batch for faster inference speed at
+        the cost of higher memory usage.
+        """
+        # TODO: change to .repeat(2) ?
+        sample_twice = torch.cat([sample] * 2)
+        #timestep_twice = torch.cat([timestep] * 2)
+
+        unet_kwargs = dict(
+            cross_attention_kwargs=dict(
+                percent_through=step_index / total_steps,
+            )
+        )
+
+        for addon in addons:
+            addon.pre_unet_step(
+                sample=sample,
+                timestep=timestep,
+                step_index=step_index,
+                total_steps=total_steps,
+                conditioning_data=conditioning_data,
+
+                unet_kwargs=unet_kwargs,
+                conditioning_mode="both",
+            )
+
+        # TODO: encoder_attention_mask
+        conditioning_data.to_unet_kwargs(unet_kwargs, "both")
+
+        both_results = self._unet_forward(
+            sample_twice,
+            timestep,
+            # conditioning_data
+            #both_conditionings,
+            #encoder_attention_mask=encoder_attention_mask,
+            #added_cond_kwargs=added_cond_kwargs,
+
+            # extra_guidance
+            #down_block_additional_residuals=down_block_additional_residuals, # cn
+            #mid_block_additional_residual=mid_block_additional_residual, # cn
+            #down_intrablock_additional_residuals=down_intrablock_additional_residuals, # t2i
+
+            #cross_attention_kwargs=cross_attention_kwargs,
+
+            **unet_kwargs,
+        )
+        negative_next_x, positive_next_x = both_results.chunk(2)
+        return negative_next_x, positive_next_x
+
+
+    def _apply_standard_conditioning_sequentially(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        conditioning_data: TextConditioningData,
+        step_index: int,
+        total_steps: int,
+        addons: List,
+    ):
+        """Runs the conditioned and unconditioned UNet forward passes sequentially for lower memory usage at the cost of
+        slower execution speed.
+        """
+
+        ###################
+        # Negative pass
+        ###################
+
+        negative_unet_kwargs = dict(
+            cross_attention_kwargs=dict(
+                percent_through=step_index / total_steps,
+            )
+        )
+        for addon in addons:
+            addon.pre_unet_step(
+                sample=sample,
+                timestep=timestep,
+                step_index=step_index,
+                total_steps=total_steps,
+                conditioning_data=conditioning_data,
+
+                unet_kwargs=negative_unet_kwargs,
+                conditioning_mode="negative",
+            )
+
+        conditioning_data.to_unet_kwargs(negative_unet_kwargs, "negative")
+
+        negative_next_x = self._unet_forward(
+            sample,
+            timestep,
+            **negative_unet_kwargs,
+        )
+
+        del negative_unet_kwargs
+        # TODO: gc.collect() ?
+
+        ###################
+        # Positive pass
+        ###################
+
+        positive_unet_kwargs = dict(
+            cross_attention_kwargs=dict(
+                percent_through=step_index / total_steps,
+            )
+        )
+        for addon in addons:
+            addon.pre_unet_step(
+                sample=sample,
+                timestep=timestep,
+                step_index=step_index,
+                total_steps=total_steps,
+                conditioning_data=conditioning_data,
+
+                unet_kwargs=positive_unet_kwargs,
+                conditioning_mode="positive",
+            )
+
+        conditioning_data.to_unet_kwargs(positive_unet_kwargs, "positive")
+
+        # Run conditioned UNet denoising (i.e. positive prompt).
+        positive_next_x = self._unet_forward(
+            sample,
+            timestep,
+            **positive_unet_kwargs,
+        )
+
+        del positive_unet_kwargs
+        # TODO: gc.collect() ?
+
+        return negative_next_x, positive_next_x
+
+
+    def _unet_forward(
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        encoder_hidden_states: torch.Tensor, # TODO: kwarg from to_unet_kwargs
+        cross_attention_kwargs: Optional[dict[str, Any]] = None,
+        inpaint_channels: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        # TODO: timestep repeat to batch size
+
+        if inpaint_channels is not None:
+            print(inpaint_channels.shape)
+            print(sample.shape)
+            sample = torch.cat([sample, inpaint_channels], dim=1)
+
+        return self.unet(
+            sample,
+            timestep,
+            encoder_hidden_states,
             cross_attention_kwargs=cross_attention_kwargs,
             **kwargs,
         ).sample
