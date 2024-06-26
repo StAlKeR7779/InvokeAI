@@ -8,11 +8,11 @@ import torch
 from pydantic import Field
 
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import TextConditioningData
-
+from .base import AddonBase
 
 
 @dataclass
-class T2IAdapterAddon:
+class T2IAdapterAddon(AddonBase):
     adapter_state: List[torch.Tensor] = Field() # TODO: wtf, why here dict before
     weight: Union[float, List[float]] = Field(default=1.0)
     begin_step_percent: float = Field(default=0.0)

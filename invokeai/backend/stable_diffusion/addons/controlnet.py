@@ -9,10 +9,11 @@ from pydantic import Field
 
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import TextConditioningData
 from invokeai.backend.util.hotfixes import ControlNetModel
+from .base import AddonBase
 
 
 @dataclass
-class ControlNetAddon:
+class ControlNetAddon(AddonBase):
     model: ControlNetModel = Field(default=None)
     image_tensor: torch.Tensor = Field(default=None)
     weight: Union[float, List[float]] = Field(default=1.0)

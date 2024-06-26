@@ -23,10 +23,7 @@ from invokeai.app.services.config.config_default import get_config
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import IPAdapterData, TextConditioningData
 from invokeai.backend.stable_diffusion.diffusion.shared_invokeai_diffusion import InvokeAIDiffuserComponent
 from invokeai.backend.stable_diffusion.diffusion.unet_attention_patcher import UNetAttentionPatcher, UNetAttentionPatcher_new, UNetIPAdapterData
-from invokeai.backend.stable_diffusion.diffusion.addons.controlnet import ControlNetAddon
-from invokeai.backend.stable_diffusion.diffusion.addons.ip_adapter import IPAdapterAddon
-from invokeai.backend.stable_diffusion.diffusion.addons.t2i_adapter import T2IAdapterAddon
-from invokeai.backend.stable_diffusion.diffusion.addons.inpaint_model import InpaintModelAddon
+from invokeai.backend.stable_diffusion.diffusion.addons import AddonBase, ControlNetAddon, IPAdapterAddon, T2IAdapterAddon, InpaintModelAddon, DepthModelAddon
 from invokeai.backend.util.attention import auto_detect_slice_size
 from invokeai.backend.util.devices import TorchDevice
 from invokeai.backend.util.hotfixes import ControlNetModel
@@ -102,6 +99,8 @@ def image_resized_to_grid_as_tensor(image: PIL.Image.Image, normalize: bool = Tr
         tensor = tensor * 2.0 - 1.0
     return tensor
 
+def is_depth_model(unet: UNet2DConditionModel):
+    return unet.conv_in.in_channels == 5
 
 def is_inpainting_model(unet: UNet2DConditionModel):
     return unet.conv_in.in_channels == 9
@@ -713,7 +712,7 @@ class StableDiffusionBackend:
         mask: Optional[torch.Tensor] = None,
         masked_latents: Optional[torch.Tensor] = None,
         gradient_mask: bool = False,
-        addons: List = [],
+        addons: List[AddonBase] = [],
     ) -> torch.Tensor:
 
         if init_timestep.shape[0] == 0:
@@ -730,8 +729,6 @@ class StableDiffusionBackend:
         if timesteps.shape[0] == 0:
             return latents
 
-
-        # inpaint 
 
         inpaint_helper = None
 
@@ -755,31 +752,35 @@ class StableDiffusionBackend:
             inpaint_helper = AddsMaskGuidance(mask, orig_latents, self.scheduler, noise, gradient_mask)
 
 
+        # as example
+        if is_depth_model(self.unet):
+            depth_mask = None # TODO: torch.Tensor [b, 1, w, h]
+            if depth_mask is None:
+                raise Exception("Depth mask required when depth model used!")
+            addons.append(DepthModelAddon(depth_mask=depth_mask))
 
-
-        # moved to attention patcher
-        #self._adjust_memory_efficient_attention(latents)
-        #if use_ip_adapter or use_regional_prompting:
-        #    ip_adapters: Optional[List[UNetIPAdapterData]] = (
-        #        [dict(ip_adapter=ipa.ip_adapter_model, target_blocks=ipa.target_blocks) for ipa in ip_adapter_data]
-        #        if use_ip_adapter
-        #        else None
-        #    )
-        #    unet_attention_patcher = UNetAttentionPatcher(ip_adapters)
-        #    attn_ctx = unet_attention_patcher.apply_ip_adapter_attention(self.unet)
-
-        with UNetAttentionPatcher_new(self.unet, addons):
+        def report_progress(
+            step,
+            latents,
+        ):
             callback(
                 PipelineIntermediateState(
-                    step=-1,
+                    step=step,
                     order=self.scheduler.order,
                     total_steps=len(timesteps),
-                    timestep=self.scheduler.config.num_train_timesteps,
+                    timestep=int(timesteps[step]), # TODO: is there any code which uses it?
                     latents=latents,
+                    predicted_original=latents, # TODO: is there any reason for additional field?
                 )
             )
 
-            for step_index, timestep in enumerate(self.progress_bar(timesteps)):
+        with UNetAttentionPatcher_new(self.unet, addons):
+            report_progress(
+                step=-1,
+                latents=latents,
+            )
+
+            for step_index, timestep in enumerate(tqdm(timesteps)):
                 if inpaint_helper is not None:
                     latents = inpaint_helper.apply_mask(latents, timestep)
 
@@ -797,22 +798,18 @@ class StableDiffusionBackend:
                 latents = step_output.prev_sample
                 if hasattr(step_output, "denoised"):
                     predicted_original = step_output.denoised
+                elif hasattr(step_output, "pred_original_sample"):
+                    predicted_original = step_output.pred_original_sample
                 else:
-                    predicted_original = getattr(step_output, "pred_original_sample", latents)
+                    predicted_original = latents
 
                 if inpaint_helper is not None:
                     # TODO: or timesteps[-1]
                     predicted_original = inpaint_helper.apply_mask(predicted_original, self.scheduler.timesteps[-1])
 
-                callback(
-                    PipelineIntermediateState(
-                        step=step_index,
-                        order=self.scheduler.order,
-                        total_steps=len(timesteps),
-                        timestep=int(timestep),
-                        latents=latents,
-                        predicted_original=predicted_original,
-                    )
+                report_progress(
+                    step=step_index,
+                    latents=predicted_original,
                 )
 
         # restore unmasked part after the last step is completed
@@ -827,22 +824,6 @@ class StableDiffusionBackend:
 
         return latents
 
-    # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/pipeline_utils.py#L1624
-    def progress_bar(self, iterable=None, total=None):
-        if not hasattr(self, "_progress_bar_config"):
-            self._progress_bar_config = {}
-        elif not isinstance(self._progress_bar_config, dict):
-            raise ValueError(
-                f"`self._progress_bar_config` should be of type `dict`, but is {type(self._progress_bar_config)}."
-            )
-
-        if iterable is not None:
-            return tqdm(iterable, **self._progress_bar_config)
-        elif total is not None:
-            return tqdm(total=total, **self._progress_bar_config)
-        else:
-            raise ValueError("Either `total` or `iterable` has to be defined.")
-
 
     @torch.inference_mode()
     def step(
@@ -853,7 +834,7 @@ class StableDiffusionBackend:
         step_index: int,
         total_steps: int,
         scheduler_step_kwargs: dict[str, Any],
-        addons: List,
+        addons: List[AddonBase],
     ):
 
         latent_model_input = self.scheduler.scale_model_input(latents, timestep)
@@ -885,8 +866,8 @@ class StableDiffusionBackend:
 
         # lol, is this just lerp?
         # out = start + weight * (end - start)
-        # noise_pred = torch.lerp(negative_noise_pred, positive_noise_pred, guidance_scale)
-        noise_pred = negative_noise_pred + guidance_scale * (positive_noise_pred - negative_noise_pred)
+        noise_pred = torch.lerp(negative_noise_pred, positive_noise_pred, guidance_scale)
+        # noise_pred = negative_noise_pred + guidance_scale * (positive_noise_pred - negative_noise_pred)
         
 
         # cfg rescale
@@ -918,12 +899,11 @@ class StableDiffusionBackend:
         conditioning_data: TextConditioningData,
         step_index: int,
         total_steps: int,
-        addons: List,
+        addons: List[AddonBase],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Runs the conditioned and unconditioned UNet forward passes in a single batch for faster inference speed at
         the cost of higher memory usage.
         """
-        # TODO: change to .repeat(2) ?
         sample_twice = torch.cat([sample] * 2)
         #timestep_twice = torch.cat([timestep] * 2)
 
@@ -972,11 +952,11 @@ class StableDiffusionBackend:
     def _apply_standard_conditioning_sequentially(
         self,
         sample: torch.Tensor,
-        timestep,
+        timestep: torch.Tensor,
         conditioning_data: TextConditioningData,
         step_index: int,
         total_steps: int,
-        addons: List,
+        addons: List[AddonBase],
     ):
         """Runs the conditioned and unconditioned UNet forward passes sequentially for lower memory usage at the cost of
         slower execution speed.
@@ -1054,17 +1034,17 @@ class StableDiffusionBackend:
         self,
         sample: torch.Tensor,
         timestep: Union[torch.Tensor, float, int],
-        encoder_hidden_states: torch.Tensor, # TODO: kwarg from to_unet_kwargs
+        encoder_hidden_states: torch.Tensor,
         cross_attention_kwargs: Optional[dict[str, Any]] = None,
-        inpaint_channels: Optional[torch.Tensor] = None,
+        extra_channels: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         # TODO: timestep repeat to batch size
 
-        if inpaint_channels is not None:
-            print(inpaint_channels.shape)
+        if extra_channels is not None:
+            print(extra_channels.shape)
             print(sample.shape)
-            sample = torch.cat([sample, inpaint_channels], dim=1)
+            sample = torch.cat([sample, extra_channels], dim=1)
 
         return self.unet(
             sample,

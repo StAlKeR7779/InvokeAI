@@ -9,11 +9,9 @@ from pydantic import Field
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import TextConditioningData
 from .base import AddonBase
 
-
 @dataclass
-class InpaintModelAddon(AddonBase):
-    mask: Optional[torch.Tensor] = None
-    masked_latents: Optional[torch.Tensor] = None
+class DepthModelAddon(AddonBase):
+    depth_mask: torch.Tensor
 
     def pre_unet_step(
         self,
@@ -30,17 +28,8 @@ class InpaintModelAddon(AddonBase):
         if conditioning_mode == "both":
             batch_size *= 2
 
-        if self.mask is None:
-            self.mask = torch.ones_like(sample[:1, :1])
-
-        if self.masked_latents is None:
-            self.masked_latents = torch.zeros_like(sample[:1])
-
-        b_mask = torch.cat([self.mask] * batch_size)
-        b_masked_latents = torch.cat([self.masked_latents] * batch_size)
-
-        extra_channels = torch.cat([b_mask, b_masked_latents], dim=1).to(device=sample.device, dtype=sample.dtype)
+        b_depth_mask = torch.cat([self.depth_mask] * batch_size).to(device=sample.device, dtype=sample.dtype)
 
         unet_kwargs.update(dict(
-            extra_channels=extra_channels,
+            extra_channels=b_depth_mask,
         ))

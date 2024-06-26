@@ -9,10 +9,11 @@ from pydantic import Field
 
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import TextConditioningData
 from invokeai.backend.stable_diffusion.diffusion.regional_ip_data import RegionalIPData
+from .base import AddonBase
 
 
 @dataclass
-class IPAdapterAddon:
+class IPAdapterAddon(AddonBase):
     model: IPAdapter
     conditioning: IPAdapterConditioningInfo
     mask: torch.Tensor
