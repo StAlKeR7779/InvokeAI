@@ -21,6 +21,7 @@ from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 
 from invokeai.app.services.config.config_default import get_config
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import IPAdapterData, TextConditioningData
+from invokeai.backend.stable_diffusion.diffusion.custom_atttention import CustomAttnProcessor2_0
 from invokeai.backend.stable_diffusion.diffusion.shared_invokeai_diffusion import InvokeAIDiffuserComponent
 from invokeai.backend.stable_diffusion.diffusion.unet_attention_patcher import UNetAttentionPatcher, UNetIPAdapterData
 from invokeai.backend.util.attention import auto_detect_slice_size
@@ -611,20 +612,22 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
             **kwargs,
         ).sample
 
-from abc import ABC
+from abc import ABC, abstractmethod
 import dataclasses
 from functools import partial
 from tqdm.auto import tqdm
+from contextlib import contextmanager
 
 @dataclass
 class InjectionInfo:
     type: str
     name: str
-    order: str
+    order: Optional[str]
+    function: Callable
 
 def modifier(name, order="any"):
     def _decorator(func):
-        func.__inj_info__ = InjectionInfo(
+        func.__inj_info__ = dict(
             type="modifier",
             name=name,
             order=order,
@@ -634,10 +637,9 @@ def modifier(name, order="any"):
 
 def override(name):
     def _decorator(func):
-        func.__inj_info__ = InjectionInfo(
+        func.__inj_info__ = dict(
             type="override",
             name=name,
-            order="any",
         )
         return func
     return _decorator
@@ -651,7 +653,16 @@ class ExtensionBase:
             if not callable(func) or not hasattr(func, "__inj_info__"):
                 continue
 
-            self.injections.append((func.__inj_info__, func))
+            self.injections.append(InjectionInfo(**func.__inj_info__, function=func))
+
+    @abstractmethod
+    def apply_attention_processor(self, attention_processor_cls):
+        pass
+
+    @abstractmethod
+    def restore_attention_processor(self):
+        pass
+
 
 
 class InpaintExt(ExtensionBase):
@@ -863,6 +874,113 @@ class T2IAdapterExt(ExtensionBase):
                 ctx.unet_kwargs.down_intrablock_additional_residuals[i] += value * weight
 
 
+class ControlNetExt(ExtensionBase):
+    def __init__(
+        self,
+        model: ControlNetModel,
+        image_tensor: torch.Tensor,
+        weight: Union[float, List[float]],
+        begin_step_percent: float,
+        end_step_percent: float,
+        control_mode: str,
+        resize_mode: str,
+        priority: int,
+    ):
+        super().__init__(priority=priority)
+        self.model = model
+        self.image_tensor = image_tensor
+        self.weight = weight
+        self.begin_step_percent = begin_step_percent
+        self.end_step_percent = end_step_percent
+        self.control_mode = control_mode
+        self.resize_mode = resize_mode
+
+    def apply_attention_processor(self, attention_processor_cls):
+        self._original_processors = self.model.attn_processors
+        self.model.set_attn_processor(attention_processor_cls())
+
+    def restore_attention_processor(self):
+        self.model.set_attn_processor(self._original_processors)
+        del self._original_processors
+
+    @modifier("pre_unet_forward")
+    def pre_unet_step(self, ctx):
+        # skip if model not active in current step
+        total_steps = len(ctx.timesteps)
+        first_step = math.floor(self.begin_step_percent * total_steps)
+        last_step  = math.ceil(self.end_step_percent * total_steps)
+        if ctx.step_index < first_step or ctx.step_index > last_step:
+            return
+
+        # convert mode to internal flags
+        soft_injection = self.control_mode in ["more_prompt", "more_control"]
+        cfg_injection  = self.control_mode in ["more_control", "unbalanced"]
+
+        # no negative conditioning in cfg_injection mode
+        if cfg_injection:
+            if ctx.conditioning_mode == "negative":
+                return
+            down_samples, mid_sample = self._run(ctx, soft_injection, "positive")
+
+            if ctx.conditioning_mode == "both":
+                # add zeros as samples for negative conditioning
+                down_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_samples]
+                mid_sample = torch.cat([torch.zeros_like(mid_sample), mid_sample])
+
+        else:
+            down_samples, mid_sample = self._run(ctx, soft_injection, ctx.conditioning_mode)
+
+
+        if ctx.unet_kwargs.down_block_additional_residuals is None and ctx.unet_kwargs.mid_block_additional_residual is None:
+            ctx.unet_kwargs.down_block_additional_residuals, ctx.unet_kwargs.mid_block_additional_residual = down_samples, mid_sample
+        else:
+            # add controlnet outputs together if have multiple controlnets
+            ctx.unet_kwargs.down_block_additional_residuals = [
+                samples_prev + samples_curr
+                for samples_prev, samples_curr in zip(ctx.unet_kwargs.down_block_additional_residuals, down_samples, strict=True)
+            ]
+            ctx.unet_kwargs.mid_block_additional_residual += mid_sample
+
+    def _run(self, ctx, soft_injection, conditioning_mode):
+        total_steps = len(ctx.timesteps)
+        model_input = ctx.latent_model_input
+        if conditioning_mode == "both":
+            model_input = torch.cat([model_input] * 2)
+
+        cn_unet_kwargs = UNetKwargs(
+            sample=model_input,
+            timestep=ctx.timestep,
+            encoder_hidden_states=None, # set later by conditoning
+
+            cross_attention_kwargs=dict(
+                percent_through=ctx.step_index / total_steps,
+            ),
+        )
+
+        ctx.conditioning_data.to_unet_kwargs(cn_unet_kwargs, conditioning_mode=conditioning_mode)
+
+        # get static weight, or weight corresponding to current step
+        weight = self.weight
+        if isinstance(weight, list):
+            weight = weight[ctx.step_index]
+
+        tmp_kwargs = vars(cn_unet_kwargs)
+        tmp_kwargs.pop("down_block_additional_residuals", None)
+        tmp_kwargs.pop("mid_block_additional_residual", None)
+        tmp_kwargs.pop("down_intrablock_additional_residuals", None)
+
+        # controlnet(s) inference
+        down_samples, mid_sample = self.model(
+            controlnet_cond=self.image_tensor,
+            conditioning_scale=weight,  # controlnet specific, NOT the guidance scale
+            guess_mode=soft_injection,  # this is still called guess_mode in diffusers ControlNetModel
+            return_dict=False,
+            **vars(cn_unet_kwargs),
+        )
+
+        return down_samples, mid_sample
+
+
 class ExtModifiersApi(ABC):
     def pre_denoise_loop(self, ctx):
         pass
@@ -896,8 +1014,7 @@ class ProxyCallsClass:
         return partial(self._handler, item)
 
 class ModifierInjectionPoint:
-    def __init__(self, name):
-        self.name = name
+    def __init__(self):
         self.first = []
         self.any = []
         self.last = []
@@ -922,7 +1039,6 @@ class ModifierInjectionPoint:
 class ExtensionsManager:
     def __init__(self):
         self.extensions = []
-        self.ordered_extensions = []
 
         self._overrides = dict()
         self._modifiers = dict()
@@ -933,21 +1049,22 @@ class ExtensionsManager:
 
     def add_extension(self, ext):
         self.extensions.append(ext)
-        self.ordered_extensions = sorted(self.extensions, reverse=True, key=lambda ext: ext.priority)
+        ordered_extensions = sorted(self.extensions, reverse=True, key=lambda ext: ext.priority)
 
         self._overrides.clear()
         self._modifiers.clear()
 
-        for ext in self.ordered_extensions:
-            for inj_info, inj_func in ext.injections:
+        for ext in ordered_extensions:
+            for inj_info in ext.injections:
                 if inj_info.type == "modifier":
                     if inj_info.name not in self._modifiers:
-                        self._modifiers[inj_info.name] = ModifierInjectionPoint(inj_info.name)
-                    self._modifiers[inj_info.name].add(inj_func, inj_info.order)
+                        self._modifiers[inj_info.name] = ModifierInjectionPoint()
+                    self._modifiers[inj_info.name].add(inj_info.function, inj_info.order)
+
                 else:
                     if inj_info.name in self._overrides:
                         raise Exception(f"Already overloaded - {inj_info.name}")
-                    self._overrides[inj_info.name] = inj_func
+                    self._overrides[inj_info.name] = inj_info.function
 
     def call_modifier(self, name, ctx):
         if name in self._modifiers:
@@ -958,6 +1075,28 @@ class ExtensionsManager:
             return self._overrides[name](orig_func, ctx)
         else:
             return orig_func(ctx, self)
+
+    @contextmanager
+    def patch_attention_processor(self, unet, attn_processor_cls):
+        unet_orig_processors = unet.attn_processors
+        patched_extensions = []
+        try:
+            # just to be sure that attentions have not same processor instance
+            attn_procs = dict()
+            for idx, name in enumerate(unet.attn_processors.keys()):
+                attn_procs[name] = attn_processor_cls()
+            unet.set_attn_processor(attn_procs)
+
+            for ext in self.extensions:
+                ext.apply_attention_processor(attn_processor_cls)
+                patched_extensions.append(ext)
+
+            yield None
+
+        finally:
+            unet.set_attn_processor(unet_orig_processors)
+            for ext in patched_extensions:
+                ext.restore_attention_processor()
 
 @dataclass
 class UNetKwargs:
@@ -993,6 +1132,7 @@ class DenoiseContext:
     unet_kwargs: Optional[UNetKwargs] = None
 
     latent_model_input: Optional[torch.Tensor] = None
+    conditioning_mode: Optional[str] = None
     negative_noise_pred: Optional[torch.Tensor] = None
     positive_noise_pred: Optional[torch.Tensor] = None
     noise_pred: Optional[torch.Tensor] = None
@@ -1054,9 +1194,20 @@ class StableDiffusionBackend:
         #    for ip_adapter in ip_adapter_data:
         #        ext_controller.add_extension(IPAdapterExt(ip_adapter, priority=100))
 
-        #if control_data is not None:
-        #    for controlnet in control_data:
-        #        ext_controller.add_extension(ControlNetExt(controlnet, priority=100))
+        if control_data is not None:
+            for controlnet in control_data:
+                ext_controller.add_extension(
+                    ControlNetExt(
+                        model=controlnet.model,
+                        image_tensor=controlnet.image_tensor,
+                        weight=controlnet.weight,
+                        begin_step_percent=controlnet.begin_step_percent,
+                        end_step_percent=controlnet.end_step_percent,
+                        control_mode=controlnet.control_mode,
+                        resize_mode=controlnet.resize_mode,
+                        priority=100,
+                    )
+                )
 
         ext_controller.add_extension(PreviewExt(callback, priority=99999))
 
@@ -1091,19 +1242,21 @@ class StableDiffusionBackend:
         # apply attention to unet and call in all extensions .apply_attention_processor(CustomAttentionProcessor)
         # ip adapters - for now add .add_ip_adapter method in CustomAttentionProcessor, in patcher iterate through unet processors and call this method
         #with UNetAttentionPatcher_new(ctx.unet, addons):
-        for ctx.step_index, ctx.timestep in enumerate(tqdm(ctx.timesteps)):
+        # TODO: ip adapters
+        with ext_controller.patch_attention_processor(ctx.unet, CustomAttnProcessor2_0):
+            for ctx.step_index, ctx.timestep in enumerate(tqdm(ctx.timesteps)):
 
-            # ext: inpaint (apply mask to latents on non-inpaint models)
-            ext_controller.modifiers.pre_step(ctx)
+                # ext: inpaint (apply mask to latents on non-inpaint models)
+                ext_controller.modifiers.pre_step(ctx)
 
-            # ext: tiles? [override: step]
-            ctx.step_output = ext_controller.overrides.step(self.step, ctx) # , ext_controller)
+                # ext: tiles? [override: step]
+                ctx.step_output = ext_controller.overrides.step(self.step, ctx) # , ext_controller)
 
-            # ext: inpaint[post_step, priority=high] (apply mask to preview on non-inpaint models)
-            # ext: preview[post_step, priority=low]
-            ext_controller.modifiers.post_step(ctx)
+                # ext: inpaint[post_step, priority=high] (apply mask to preview on non-inpaint models)
+                # ext: preview[post_step, priority=low]
+                ext_controller.modifiers.post_step(ctx)
 
-            ctx.latents = ctx.step_output.prev_sample
+                ctx.latents = ctx.step_output.prev_sample
 
         # ext: inpaint[post_denoise_loop] (restore unmasked part)
         ext_controller.modifiers.post_denoise_loop(ctx)
@@ -1162,7 +1315,9 @@ class StableDiffusionBackend:
                 percent_through=ctx.step_index / len(ctx.timesteps), # ctx.total_steps,
             )
         )
-        ctx.conditioning_data.to_unet_kwargs(ctx.unet_kwargs, "both")
+
+        ctx.conditioning_mode = "both"
+        ctx.conditioning_data.to_unet_kwargs(ctx.unet_kwargs, ctx.conditioning_mode)
 
         # ext: controlnet/ip/t2i [pre_unet_forward]
         ext_controller.modifiers.pre_unet_forward(ctx)
@@ -1179,6 +1334,7 @@ class StableDiffusionBackend:
         negative_next_x, positive_next_x = both_results.chunk(2)
         # del locals
         del ctx.unet_kwargs
+        del ctx.conditioning_mode
         return negative_next_x, positive_next_x
 
 
@@ -1200,6 +1356,8 @@ class StableDiffusionBackend:
                 percent_through=ctx.step_index / len(ctx.timesteps), # ctx.total_steps,
             )
         )
+
+        ctx.conditioning_mode = "negative"
         ctx.conditioning_data.to_unet_kwargs(ctx.unet_kwargs, "negative")
 
         # ext: controlnet/ip/t2i [pre_unet_forward]
@@ -1216,6 +1374,7 @@ class StableDiffusionBackend:
         )
 
         del ctx.unet_kwargs
+        del ctx.conditioning_mode
         # TODO: gc.collect() ?
 
         ###################
@@ -1231,6 +1390,8 @@ class StableDiffusionBackend:
                 percent_through=ctx.step_index / len(ctx.timesteps), # ctx.total_steps,
             )
         )
+
+        ctx.conditioning_mode = "positive"
         ctx.conditioning_data.to_unet_kwargs(ctx.unet_kwargs, "positive")
 
         # ext: controlnet/ip/t2i [pre_unet_forward]
@@ -1247,6 +1408,7 @@ class StableDiffusionBackend:
         )
 
         del ctx.unet_kwargs
+        del ctx.conditioning_mode
         # TODO: gc.collect() ?
 
         return negative_next_x, positive_next_x
