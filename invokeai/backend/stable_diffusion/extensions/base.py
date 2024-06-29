@@ -1,6 +1,7 @@
 from typing import Optional, Callable, List
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from diffusers import UNet2DConditionModel
 
 @dataclass
 class InjectionInfo:
@@ -43,4 +44,10 @@ class ExtensionBase(ABC):
         pass
 
     def restore_attention_processor(self):
+        pass
+
+    def patch_unet(self, unet: UNet2DConditionModel):
+        pass
+
+    def unpatch_unet(self, unet: UNet2DConditionModel):
         pass

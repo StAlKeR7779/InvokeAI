@@ -123,3 +123,18 @@ class ExtensionsManager:
             unet.set_attn_processor(unet_orig_processors)
             for ext in patched_extensions:
                 ext.restore_attention_processor()
+
+    @contextmanager
+    def patch_unet(self, unet: UNet2DConditionModel):
+        _extensions = []
+        try:
+            ordered_extensions = sorted(self.extensions, reverse=True, key=lambda ext: ext.priority)
+            for ext in ordered_extensions:
+                ext.patch_unet(unet)
+                _extensions.append(ext)
+
+            yield None
+
+        finally:
+            for ext in _extensions:
+                ext.unpatch_unet(unet)

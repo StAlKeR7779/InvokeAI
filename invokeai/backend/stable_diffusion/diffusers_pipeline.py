@@ -30,7 +30,7 @@ from invokeai.backend.util.attention import auto_detect_slice_size
 from invokeai.backend.util.devices import TorchDevice
 from invokeai.backend.util.hotfixes import ControlNetModel
 
-from .extensions import PipelineIntermediateState, InpaintExt, ControlNetExt, PreviewExt, RescaleCFGExt, T2IAdapterExt
+from .extensions import PipelineIntermediateState, InpaintExt, ControlNetExt, PreviewExt, RescaleCFGExt, T2IAdapterExt, IPAdapterExt
 from .extensions_manager import ExtensionsManager
 
 
@@ -647,10 +647,32 @@ class StableDiffusionBackend:
                         priority=100,
                     )
                 )
+        """
+                IPAdapterData(
+                    ip_adapter_model=ip_adapter_model,
+                    weight=single_ip_adapter.weight,
+                    target_blocks=single_ip_adapter.target_blocks,
+                    begin_step_percent=single_ip_adapter.begin_step_percent,
+                    end_step_percent=single_ip_adapter.end_step_percent,
+                    ip_adapter_conditioning=IPAdapterConditioningInfo(image_prompt_embeds, uncond_image_prompt_embeds),
+                    mask=mask,
+                )
+        """
 
-        #if ip_adapter_data is not None:
-        #    for ip_adapter in ip_adapter_data:
-        #        ext_controller.add_extension(IPAdapterExt(ip_adapter, priority=100))
+        if ip_adapter_data is not None:
+            for ip_adapter in ip_adapter_data:
+                ext_controller.add_extension(
+                    IPAdapterExt(
+                        model=ip_adapter.ip_adapter_model,
+                        conditioning=ip_adapter.ip_adapter_conditioning,
+                        mask=ip_adapter.mask,
+                        target_blocks=ip_adapter.target_blocks,
+                        weight=ip_adapter.weight,
+                        begin_step_percent=ip_adapter.begin_step_percent,
+                        end_step_percent=ip_adapter.end_step_percent,
+                        priority=100
+                    )
+                )
 
         if control_data is not None:
             for controlnet in control_data:
@@ -699,7 +721,10 @@ class StableDiffusionBackend:
         # ip adapters - for now add .add_ip_adapter method in CustomAttentionProcessor, in patcher iterate through unet processors and call this method
         #with UNetAttentionPatcher_new(ctx.unet, addons):
         # TODO: ip adapters
-        with ext_controller.patch_attention_processor(ctx.unet, CustomAttnProcessor2_0):
+        with (
+            ext_controller.patch_attention_processor(ctx.unet, CustomAttnProcessor2_0),
+            ext_controller.patch_unet(ctx.unet),
+        ):
             for ctx.step_index, ctx.timestep in enumerate(tqdm(ctx.timesteps)):
 
                 # ext: inpaint (apply mask to latents on non-inpaint models)
