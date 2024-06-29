@@ -712,12 +712,14 @@ class InpaintExt(ExtensionBase):
                     generator=torch.Generator(device="cpu").manual_seed(ctx.seed),
                 ).to(device=ctx.orig_latents.device, dtype=ctx.orig_latents.dtype)
 
-    @modifier("pre_step") # last?
+    # do first to make other extensions works with changed latents
+    @modifier("pre_step", order="first")
     def apply_mask_to_latents(self, ctx):
         if self._is_inpaint_model(ctx.unet) or self.mask is None:
             return
         ctx.latents = self._apply_mask(ctx, ctx.latents, ctx.timestep)
 
+    # do last so that other extensions works with normal latents
     @modifier("pre_unet_forward", order="last")
     def append_inpaint_layers(self, ctx):
         if not self._is_inpaint_model(ctx.unet):
@@ -766,8 +768,9 @@ class PreviewExt(ExtensionBase):
         super().__init__(priority=priority)
         self.callback = callback
 
-    @modifier("pre_denoise_loop")
-    def initial_preview(self, ctx, order="last"):
+    # do last so that all other changes shown
+    @modifier("pre_denoise_loop", order="last")
+    def initial_preview(self, ctx):
         self.callback(
             PipelineIntermediateState(
                 step=-1,
@@ -778,6 +781,7 @@ class PreviewExt(ExtensionBase):
             )
         )
 
+    # do last so that all other changes shown
     @modifier("post_step", order="last")
     def step_preview(self, ctx):
         if hasattr(ctx.step_output, "denoised"):
@@ -891,7 +895,7 @@ class ProxyCallsClass:
     def __getattr__(self, item):
         return partial(self._handler, item)
 
-class InjectionPoint:
+class ModifierInjectionPoint:
     def __init__(self, name):
         self.name = name
         self.first = []
@@ -919,10 +923,9 @@ class ExtensionsManager:
     def __init__(self):
         self.extensions = []
         self.ordered_extensions = []
-        self.injections = dict(
-            modifiers=dict(),
-            overrides=dict(),
-        )
+
+        self._overrides = dict()
+        self._modifiers = dict()
 
         self.modifiers: ExtModifiersApi = ProxyCallsClass(self.call_modifier)
         self.overrides: ExtOverridesApi = ProxyCallsClass(self.call_override)
@@ -932,29 +935,27 @@ class ExtensionsManager:
         self.extensions.append(ext)
         self.ordered_extensions = sorted(self.extensions, reverse=True, key=lambda ext: ext.priority)
 
-        self.injections = dict(
-            modifier=dict(),
-            override=dict(),
-        )
+        self._overrides.clear()
+        self._modifiers.clear()
 
         for ext in self.ordered_extensions:
             for inj_info, inj_func in ext.injections:
                 if inj_info.type == "modifier":
-                    if inj_info.name not in self.injections[inj_info.type]:
-                        self.injections[inj_info.type][inj_info.name] = InjectionPoint(inj_info.name)
-                    self.injections[inj_info.type][inj_info.name].add(inj_func, inj_info.order)
+                    if inj_info.name not in self._modifiers:
+                        self._modifiers[inj_info.name] = ModifierInjectionPoint(inj_info.name)
+                    self._modifiers[inj_info.name].add(inj_func, inj_info.order)
                 else:
-                    if inj_info.name in self.injections[inj_info.type]:
+                    if inj_info.name in self._overrides:
                         raise Exception(f"Already overloaded - {inj_info.name}")
-                    self.injections[inj_info.type] = inj_func
+                    self._overrides[inj_info.name] = inj_func
 
     def call_modifier(self, name, ctx):
-        if name in self.injections["modifier"]:
-            self.injections["modifier"][name](ctx)
+        if name in self._modifiers:
+            self._modifiers[name](ctx)
 
     def call_override(self, name, orig_func, ctx):
-        if name in self.injections["override"]:
-            return self.injections["override"][name](orig_func, ctx)
+        if name in self._overrides:
+            return self._overrides[name](orig_func, ctx)
         else:
             return orig_func(ctx, self)
 
