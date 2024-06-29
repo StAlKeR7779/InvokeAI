@@ -315,6 +315,26 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
                 SD UNet model.
             is_gradient_mask: A flag indicating whether `mask` is a gradient mask or not.
         """
+
+        if True:
+            back = StableDiffusionBackend(self.unet, self.scheduler)
+            return back.latents_from_embeddings(
+                latents=latents,
+                scheduler_step_kwargs=scheduler_step_kwargs,
+                conditioning_data=conditioning_data,
+                noise=noise,
+                seed=seed,
+                timesteps=timesteps,
+                init_timestep=init_timestep,
+                callback=callback,
+                control_data=control_data,
+                ip_adapter_data=ip_adapter_data,
+                t2i_adapter_data=t2i_adapter_data,
+                mask=mask,
+                masked_latents=masked_latents,
+                is_gradient_mask=is_gradient_mask,
+            )
+
         if init_timestep.shape[0] == 0:
             return latents
 
@@ -590,3 +610,588 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
             cross_attention_kwargs=cross_attention_kwargs,
             **kwargs,
         ).sample
+
+from abc import ABC
+import dataclasses
+from functools import partial
+from tqdm.auto import tqdm
+
+@dataclass
+class InjectionInfo:
+    type: str
+    name: str
+    order: str
+
+def modifier(name, order="any"):
+    def _decorator(func):
+        func.__hook_info__ = InjectionInfo(
+            type="modifier",
+            name=name,
+            order=order,
+        )
+        return func
+    return _decorator
+
+def override(name, order="any"):
+    def _decorator(func):
+        func.__inj_info__ = InjectionInfo(
+            type="override",
+            name=name,
+            order=order,
+        )
+        return func
+    return _decorator
+
+class ExtensionBase:
+    def __init__(self, priority):
+        self.priority = priority
+        self.injections = []
+        self.overrides = dict()
+        for func_name in dir(self):
+            func = getattr(self, func_name)
+            if not callable(func) or not hasattr(func, "__inj_info__"):
+                continue
+
+            self.injections.append((func.__inj_info__, func))
+
+
+class InpaintExt(ExtensionBase):
+    mask: torch.Tensor
+    masked_latents: Optional[torch.Tensor]
+    is_gradient_mask: bool
+
+    def __init__(self, mask, masked_latents, is_gradient_mask, priority):
+        super().__init__(priority=priority)
+        self.mask = mask
+        self.masked_latents = masked_latents
+        self.is_gradient_mask = is_gradient_mask
+
+
+    def _is_inpaint_model(unet: UNet2DConditionModel):
+        return unet.conv_in.in_channels == 9
+
+    def _apply_mask(self, latents: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        batch_size = latents.size(0)
+        mask = einops.repeat(self.mask, "b c h w -> (repeat b) c h w", repeat=batch_size)
+        if t.dim() == 0:
+            # some schedulers expect t to be one-dimensional.
+            # TODO: file diffusers bug about inconsistency?
+            t = einops.repeat(t, "-> batch", batch=batch_size)
+        # Noise shouldn't be re-randomized between steps here. The multistep schedulers
+        # get very confused about what is happening from step to step when we do that.
+        mask_latents = self.scheduler.add_noise(self.mask_latents, self.noise, t)
+        # TODO: Do we need to also apply scheduler.scale_model_input? Or is add_noise appropriately scaled already?
+        # mask_latents = self.scheduler.scale_model_input(mask_latents, t)
+        mask_latents = einops.repeat(mask_latents, "b c h w -> (repeat b) c h w", repeat=batch_size)
+        if self.is_gradient_mask:
+            threshhold = (t.item()) / self.scheduler.config.num_train_timesteps
+            mask_bool = mask > threshhold  # I don't know when mask got inverted, but it did
+            masked_input = torch.where(mask_bool, latents, mask_latents)
+        else:
+            masked_input = torch.lerp(mask_latents.to(dtype=latents.dtype), latents, mask.to(dtype=latents.dtype))
+        return masked_input
+
+
+    @modifier("pre_denoise_loop")
+    def init_tensors(self, ctx):
+        #if self.mask is None:
+        #    self.mask = torch.ones_like(ctx.latents[:1, :1])
+        #if self.masked_latents is None:
+        #    self.masked_latents = torch.zeros_like(ctx.latents[:1])
+        self.mask.to(device=ctx.latents.device, dtype=ctx.latents.dtype)
+        self.masked_latents.to(device=ctx.latents.device, dtype=ctx.latents.dtype)
+
+    @modifier("pre_step") # last?
+    def apply_mask_to_latents(self, ctx):
+        if self._is_inpaint_model(ctx.unet):
+            return
+        # ctx.timesteps[ctx.step_index]
+        ctx.latents = self._apply_mask(ctx.latents, ctx.timestep)
+
+    @modifier("pre_unet_forward", order="last")
+    def append_inpaint_layers(self, ctx, step_index):
+        b_mask = torch.cat([self.mask] * ctx.batch_size)
+        b_masked_latents = torch.cat([self.masked_latents] * ctx.batch_size)
+        ctx.latent_model_input = torch.cat(
+            [unet_kwargs.latent_model_input, b_mask, b_masked_latents],
+            dim=1,
+        )
+
+    @modifier("post_step", order="first")
+    def apply_mask_to_preview(self, ctx):
+        if is_inpaint_model(ctx.unet):
+            return
+
+        timestep = ctx.scheduler.timesteps[-1]
+        if hasattr(ctx.step_output, "denoised"):
+            ctx.step_output.denoised = self._apply_mask(ctx.step_output.denoised, timestep)
+        elif hasattr(ctx.step_output, "pred_original_sample"):
+            ctx.step_output.pred_original_sample = self._apply_mask(ctx.step_output.pred_original_sample, timestep)
+        else:
+            ctx.step_output.pred_original_sample = self._apply_mask(ctx.step_output.prev_sample, timestep)
+
+    @modifier("post_denoise_loop") # last?
+    def restore_unmasked(self, ctx):
+        # restore unmasked part after the last step is completed
+        # in-process masking happens before each step
+        if self.is_gradient_mask:
+            ctx.latents = torch.where(self.mask > 0, ctx.latents, ctx.orig_latents)
+        else:
+            ctx.latents = torch.lerp(
+                ctx.orig_latents,
+                ctx.latents.to(dtype=ctx.orig_latents.dtype),
+                self.mask.to(dtype=ctx.orig_latents.dtype),
+            )
+
+
+class PreviewExt(ExtensionBase):
+    def __init__(self, callback, priority):
+        super().__init__(priority=priority)
+        self.callback = callback
+
+    @modifier("pre_denoise_loop")
+    def initial_preview(self, ctx, order="last"):
+        self.callback(
+            PipelineIntermediateState(
+                step=-1,
+                order=ctx.scheduler.order,
+                total_steps=len(ctx.timesteps),
+                timestep=int(ctx.scheduler.config.num_train_timesteps), # TODO: is there any code which uses it?
+                latents=ctx.latents,
+            )
+        )
+
+    @modifier("post_step", order="last")
+    def step_preview(self, ctx):
+        if hasattr(ctx.step_output, "denoised"):
+            predicted_original = self._apply_mask(ctx.step_output.denoised, ctx.timestep)
+        elif hasattr(ctx.step_output, "pred_original_sample"):
+            predicted_original = self._apply_mask(ctx.step_output.pred_original_sample, ctx.timestep)
+        else:
+            predicted_original = self._apply_mask(ctx.step_output.prev_sample, ctx.timestep)
+
+
+        self.callback(
+            PipelineIntermediateState(
+                step=ctx.step_index,
+                order=ctx.scheduler.order,
+                total_steps=len(ctx.timesteps),
+                timestep=int(ctx.timestep), # TODO: is there any code which uses it?
+                latents=ctx.step_output.prev_sample,
+                predicted_original=predicted_original, # TODO: is there any reason for additional field?
+            )
+        )
+
+
+class RescaleCFGExt(ExtensionBase):
+    def __init__(self, guidance_rescale_multiplier, priority):
+        super().__init__(priority=priority)
+        self.guidance_rescale_multiplier = guidance_rescale_multiplier
+
+    @staticmethod
+    def _rescale_cfg(total_noise_pred, pos_noise_pred, multiplier=0.7):
+        """Implementation of Algorithm 2 from https://arxiv.org/pdf/2305.08891.pdf."""
+        ro_pos = torch.std(pos_noise_pred, dim=(1, 2, 3), keepdim=True)
+        ro_cfg = torch.std(total_noise_pred, dim=(1, 2, 3), keepdim=True)
+
+        x_rescaled = total_noise_pred * (ro_pos / ro_cfg)
+        x_final = multiplier * x_rescaled + (1.0 - multiplier) * total_noise_pred
+        return x_final
+
+    @modifier("modify_noise_prediction")
+    def rescale_noise_pred(self, ctx):
+        if self.guidance_rescale_multiplier > 0:
+            ctx.noise_pred = self._rescale_cfg(
+                ctx.noise_pred,
+                ctx.positive_noise_pred,
+                self.guidance_rescale_multiplier,
+            )
+
+
+class ExtModifiersApi(ABC):
+    def pre_denoise_loop(self, ctx):
+        pass
+
+    def post_denoise_loop(self, ctx):
+        pass
+
+    def pre_step(self, ctx):
+        pass
+
+    def post_step(self, ctx):
+        pass
+
+    def modify_noise_prediction(self, ctx):
+        pass
+
+    def pre_unet_forward(self, ctx):
+        pass
+
+class ExtOverridesApi(ABC):
+    def step(self, orig_func, ctx):
+        pass
+
+    def combine_noise(self, orig_func, ctx):
+        pass
+
+class ProxyCallsClass:
+    def __init__(self, handler):
+        self._handler = handler
+    def __getattr__(self, item):
+        return partial(self._handler, item)
+
+class InjectionPoint:
+    def __init__(self, name):
+        self.name = name
+        self.first = []
+        self.any = []
+        self.last = []
+
+    def add(self, func, order):
+        if order == "first":
+            self.first.append(func)
+        elif order == "last":
+            self.last.append(func)
+        else: # elif order == "any":
+            self.any.append(func)
+
+    def __call__(self, *args, **kwargs):
+        for func in self.first:
+            func(*args, **kwargs)
+        for func in self.any:
+            func(*args, **kwargs)
+        for func in reversed(self.last):
+            func(*args, **kwargs)
+
+
+class ExtensionsManager:
+    def __init__(self):
+        self.extensions = []
+        self.ordered_extensions = []
+        self.injections = dict(
+            modifiers=dict(),
+            overrides=dict(),
+        )
+
+        self.modifiers: ExtModifiersApi = ProxyCallsClass(self.call_modifier)
+        self.overrides: ExtOverridesApi = ProxyCallsClass(self.call_override)
+
+
+    def add_extension(self, ext):
+        self.extensions.append(ext)
+        self.ordered_extensions = sorted(self.extensions, reverse=True, key=lambda ext: ext.priority)
+
+        self.injections = dict(
+            modifier=dict(),
+            override=dict(),
+        )
+
+        for ext in self.ordered_extensions:
+            for inj_info, inj_func in ext.injections:
+                if inj_info.type == "modifier":
+                    if inj_info.name not in self.injections[inj_info.type]:
+                        self.injections[inj_info.type][inj_info.name] = InjectionPoint(inj_info.name)
+                    self.injections[inj_info.type][inj_info.name].add(inj_func)
+                else:
+                    if inj_info.name in self.injections[inj_info.type]:
+                        raise Exception(f"Already overloaded - {inj_info.name}")
+                    self.injections[inj_info.type] = inj_func
+
+    def call_modifier(self, name, ctx):
+        if name in self.injections["modifier"]:
+            self.injections["modifier"][name](ctx)
+
+    def call_override(self, name, orig_func, ctx):
+        if name in self.injections["override"]:
+            return self.injections["override"][name](orig_func, ctx)
+        else:
+            return orig_func(ctx, self)
+
+@dataclass
+class UNetKwargs:
+    sample: torch.Tensor
+    timestep: Union[torch.Tensor, float, int]
+    encoder_hidden_states: torch.Tensor
+
+    class_labels: Optional[torch.Tensor] = None
+    timestep_cond: Optional[torch.Tensor] = None
+    attention_mask: Optional[torch.Tensor] = None
+    cross_attention_kwargs: Optional[Dict[str, Any]] = None
+    added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None
+    down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None
+    mid_block_additional_residual: Optional[torch.Tensor] = None
+    down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None
+    encoder_attention_mask: Optional[torch.Tensor] = None
+    #return_dict: bool = True
+
+@dataclass
+class DenoiseContext:
+    latents: torch.Tensor
+    scheduler_step_kwargs: dict[str, Any]
+    conditioning_data: TextConditioningData
+    noise: Optional[torch.Tensor]
+    seed: int
+    timesteps: torch.Tensor
+    init_timestep: torch.Tensor
+    
+    unet: UNet2DConditionModel
+    scheduler: SchedulerMixin
+
+    orig_latents: Optional[torch.Tensor] = None
+    unet_kwargs: Optional[UNetKwargs] = None
+
+    latent_model_input: Optional[torch.Tensor] = None
+    negative_noise_pred: Optional[torch.Tensor] = None
+    positive_noise_pred: Optional[torch.Tensor] = None
+    noise_pred: Optional[torch.Tensor] = None
+
+    def __delattr__(self, name: str):
+        setattr(self, name, None)
+
+    @classmethod
+    def from_kwargs(cls, **kwargs):
+        names = set([f.name for f in dataclasses.fields(cls)])
+        return cls(**{
+            k: v for k, v in kwargs.items() 
+            #if k in inspect.signature(cls).parameters
+            if k in names
+        })
+
+
+class StableDiffusionBackend:
+    def __init__(self, unet, scheduler):
+        self.unet = unet
+        self.scheduler = scheduler
+        self.sequential_guidance = False
+
+    def latents_from_embeddings(
+        self,
+        latents: torch.Tensor,
+        scheduler_step_kwargs: dict[str, Any],
+        conditioning_data: TextConditioningData,
+        noise: Optional[torch.Tensor],
+        seed: int,
+        timesteps: torch.Tensor,
+        init_timestep: torch.Tensor,
+        callback: Callable[[PipelineIntermediateState], None],
+        control_data: list[ControlNetData] | None = None,
+        ip_adapter_data: Optional[list[IPAdapterData]] = None,
+        t2i_adapter_data: Optional[list[T2IAdapterData]] = None,
+        mask: Optional[torch.Tensor] = None,
+        masked_latents: Optional[torch.Tensor] = None,
+        is_gradient_mask: bool = False,
+    ) -> torch.Tensor:
+        ctx = DenoiseContext.from_kwargs(**locals(), unet=self.unet, scheduler=self.scheduler)
+        ext_controller = ExtensionsManager()
+        if mask is not None or is_inpainting_model(ctx.unet):
+            ext_controller.add_extension(InpaintExt(mask, masked_latents, is_gradient_mask, priority=200))
+
+        #if t2i_adapter_data is not None:
+        #    for t2i_adapter in t2i_adapter_data:
+        #        ext_controller.add_extension(T2IAdapterExt(t2i_adapter, priority=100))
+
+        #if ip_adapter_data is not None:
+        #    for ip_adapter in ip_adapter_data:
+        #        ext_controller.add_extension(IPAdapterExt(ip_adapter, priority=100))
+
+        #if control_data is not None:
+        #    for controlnet in control_data:
+        #        ext_controller.add_extension(ControlNetExt(controlnet, priority=100))
+
+        ext_controller.add_extension(PreviewExt(callback, priority=99999))
+
+        if ctx.conditioning_data.guidance_rescale_multiplier > 0:
+            ext_controller.add_extension(RescaleCFGExt(ctx.conditioning_data.guidance_rescale_multiplier, priority=100))
+
+        return self.new_gen(ctx, ext_controller)
+
+
+
+
+    def new_gen(self, ctx, ext_controller):
+        if ctx.init_timestep.shape[0] == 0:
+            return ctx.latents
+
+        ctx.orig_latents = ctx.latents.clone()
+
+        if ctx.noise is not None:
+            batch_size = ctx.latents.shape[0]
+            # latents = noise * self.scheduler.init_noise_sigma # it's like in t2l according to diffusers
+            ctx.latents = ctx.scheduler.add_noise(ctx.latents, ctx.noise, ctx.init_timestep.expand(batch_size))
+
+        # if no work to do, return latents
+        if ctx.timesteps.shape[0] == 0:
+            return ctx.latents
+
+        # ext: inpaint[pre_denoise_loop, priority=normal] (maybe init, but not sure if it needed)
+        # ext: preview[pre_denoise_loop, priority=low]
+        ext_controller.modifiers.pre_denoise_loop(ctx)
+
+        # patch on nodes level
+        # apply attention to unet and call in all extensions .apply_attention_processor(CustomAttentionProcessor)
+        # ip adapters - for now add .add_ip_adapter method in CustomAttentionProcessor, in patcher iterate through unet processors and call this method
+        #with UNetAttentionPatcher_new(ctx.unet, addons):
+        for ctx.step_index, ctx.timestep in enumerate(tqdm(ctx.timesteps)):
+
+            # ext: inpaint (apply mask to latents on non-inpaint models)
+            ext_controller.modifiers.pre_step(ctx)
+
+            # ext: tiles? [override: step]
+            ctx.step_output = ext_controller.overrides.step(self.step, ctx) # , ext_controller)
+
+            # ext: inpaint[post_step, priority=high] (apply mask to preview on non-inpaint models)
+            # ext: preview[post_step, priority=low]
+            ext_controller.modifiers.post_step(ctx)
+
+            ctx.latents = ctx.step_output.prev_sample
+
+        # ext: inpaint[post_denoise_loop] (restore unmasked part)
+        ext_controller.modifiers.post_denoise_loop(ctx)
+        return ctx.latents
+
+
+    @torch.inference_mode()
+    def step(self, ctx, ext_controller):
+        ctx.latent_model_input = ctx.scheduler.scale_model_input(ctx.latents, ctx.timestep)
+
+        if self.sequential_guidance:
+            conditioning_call = self._apply_standard_conditioning_sequentially
+        else:
+            conditioning_call = self._apply_standard_conditioning
+
+        # not sure if here needed override
+        ctx.negative_noise_pred, ctx.positive_noise_pred = conditioning_call(ctx, ext_controller)
+
+        # ext: override combine_noise
+        ctx.noise_pred = ext_controller.overrides.combine_noise(self.combine_noise, ctx)
+
+        # ext: cfg_rescale [modify_noise_prediction]
+        ext_controller.modifiers.modify_noise_prediction(ctx)
+
+        # compute the previous noisy sample x_t -> x_t-1
+        step_output = ctx.scheduler.step(ctx.noise_pred, ctx.timestep, ctx.latents, **ctx.scheduler_step_kwargs)
+
+        # del locals
+        del ctx.latent_model_input
+        del ctx.negative_noise_pred
+        del ctx.positive_noise_pred
+        del ctx.noise_pred
+
+        return step_output
+
+    @staticmethod
+    def combine_noise(ctx, ext_controller):
+        guidance_scale = ctx.conditioning_data.guidance_scale
+        if isinstance(guidance_scale, list):
+            guidance_scale = guidance_scale[ctx.step_index]
+
+        return torch.lerp(ctx.negative_noise_pred, ctx.positive_noise_pred, guidance_scale)
+        #return ctx.negative_noise_pred + guidance_scale * (ctx.positive_noise_pred - ctx.negative_noise_pred)
+
+    def _apply_standard_conditioning(self, ctx, ext_controller) -> tuple[torch.Tensor, torch.Tensor]:
+        """Runs the conditioned and unconditioned UNet forward passes in a single batch for faster inference speed at
+        the cost of higher memory usage.
+        """
+
+        ctx.unet_kwargs = UNetKwargs(
+            sample=torch.cat([ctx.latent_model_input] * 2),
+            timestep=ctx.timestep,
+            encoder_hidden_states=None, # set later by conditoning
+
+            cross_attention_kwargs=dict(
+                percent_through=ctx.step_index / len(ctx.timesteps), # ctx.total_steps,
+            )
+        )
+        ctx.conditioning_data.to_unet_kwargs(ctx.unet_kwargs, "both")
+
+        # ext: controlnet/ip/t2i [pre_unet_forward]
+        ext_controller.modifiers.pre_unet_forward(ctx)
+
+        # ext: inpaint [pre_unet_forward, priority=low]
+        # or
+        # ext: inpaint [override: unet_forward]
+        both_results = self._unet_forward(
+            **vars(ctx.unet_kwargs),
+            #torch.cat([ctx.latent_model_input] * 2),
+            #ctx.timestep,
+            #**unet_kwargs,
+        )
+        negative_next_x, positive_next_x = both_results.chunk(2)
+        # del locals
+        del ctx.unet_kwargs
+        return negative_next_x, positive_next_x
+
+
+    def _apply_standard_conditioning_sequentially(self, ctx, ext_controller):
+        """Runs the conditioned and unconditioned UNet forward passes sequentially for lower memory usage at the cost of
+        slower execution speed.
+        """
+
+        ###################
+        # Negative pass
+        ###################
+
+        ctx.unet_kwargs = UNetKwargs(
+            sample=ctx.latent_model_input,
+            timestep=ctx.timestep,
+            encoder_hidden_states=None, # set later by conditoning
+
+            cross_attention_kwargs=dict(
+                percent_through=ctx.step_index / len(ctx.timesteps), # ctx.total_steps,
+            )
+        )
+        ctx.conditioning_data.to_unet_kwargs(ctx.unet_kwargs, "negative")
+
+        # ext: controlnet/ip/t2i [pre_unet_forward]
+        ext_controller.modifiers.pre_unet_forward(ctx)
+
+        # ext: inpaint [pre_unet_forward, priority=low]
+        # or
+        # ext: inpaint [override: unet_forward]
+        negative_next_x = self._unet_forward(
+            **vars(ctx.unet_kwargs),
+            #ctx.latent_model_input,
+            #ctx.timestep,
+            #**ctx.unet_kwargs,
+        )
+
+        del ctx.unet_kwargs
+        # TODO: gc.collect() ?
+
+        ###################
+        # Positive pass
+        ###################
+
+        ctx.unet_kwargs = UNetKwargs(
+            sample=ctx.latent_model_input,
+            timestep=ctx.timestep,
+            encoder_hidden_states=None, # set later by conditoning
+
+            cross_attention_kwargs=dict(
+                percent_through=ctx.step_index / len(ctx.timesteps), # ctx.total_steps,
+            )
+        )
+        ctx.conditioning_data.to_unet_kwargs(ctx.unet_kwargs, "positive")
+
+        # ext: controlnet/ip/t2i [pre_unet_forward]
+        ext_controller.modifiers.pre_unet_forward(ctx)
+
+        # ext: inpaint [pre_unet_forward, priority=low]
+        # or
+        # ext: inpaint [override: unet_forward]
+        positive_next_x = self._unet_forward(
+            **vars(ctx.unet_kwargs),
+            #ctx.latent_model_input,
+            #ctx.timestep,
+            #**ctx.unet_kwargs,
+        )
+
+        del ctx.unet_kwargs
+        # TODO: gc.collect() ?
+
+        return negative_next_x, positive_next_x
+
+
+    def _unet_forward(self, **kwargs):
+        return self.unet(**kwargs).sample
+
