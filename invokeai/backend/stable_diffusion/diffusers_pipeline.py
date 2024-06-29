@@ -624,7 +624,7 @@ class InjectionInfo:
 
 def modifier(name, order="any"):
     def _decorator(func):
-        func.__hook_info__ = InjectionInfo(
+        func.__inj_info__ = InjectionInfo(
             type="modifier",
             name=name,
             order=order,
@@ -632,12 +632,12 @@ def modifier(name, order="any"):
         return func
     return _decorator
 
-def override(name, order="any"):
+def override(name):
     def _decorator(func):
         func.__inj_info__ = InjectionInfo(
             type="override",
             name=name,
-            order=order,
+            order="any",
         )
         return func
     return _decorator
@@ -646,7 +646,6 @@ class ExtensionBase:
     def __init__(self, priority):
         self.priority = priority
         self.injections = []
-        self.overrides = dict()
         for func_name in dir(self):
             func = getattr(self, func_name)
             if not callable(func) or not hasattr(func, "__inj_info__"):
@@ -666,11 +665,10 @@ class InpaintExt(ExtensionBase):
         self.masked_latents = masked_latents
         self.is_gradient_mask = is_gradient_mask
 
-
-    def _is_inpaint_model(unet: UNet2DConditionModel):
+    def _is_inpaint_model(self, unet: UNet2DConditionModel):
         return unet.conv_in.in_channels == 9
 
-    def _apply_mask(self, latents: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def _apply_mask(self, ctx, latents: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         batch_size = latents.size(0)
         mask = einops.repeat(self.mask, "b c h w -> (repeat b) c h w", repeat=batch_size)
         if t.dim() == 0:
@@ -679,12 +677,12 @@ class InpaintExt(ExtensionBase):
             t = einops.repeat(t, "-> batch", batch=batch_size)
         # Noise shouldn't be re-randomized between steps here. The multistep schedulers
         # get very confused about what is happening from step to step when we do that.
-        mask_latents = self.scheduler.add_noise(self.mask_latents, self.noise, t)
+        mask_latents = ctx.scheduler.add_noise(ctx.orig_latents, self.noise, t)
         # TODO: Do we need to also apply scheduler.scale_model_input? Or is add_noise appropriately scaled already?
         # mask_latents = self.scheduler.scale_model_input(mask_latents, t)
         mask_latents = einops.repeat(mask_latents, "b c h w -> (repeat b) c h w", repeat=batch_size)
         if self.is_gradient_mask:
-            threshhold = (t.item()) / self.scheduler.config.num_train_timesteps
+            threshhold = (t.item()) / ctx.scheduler.config.num_train_timesteps
             mask_bool = mask > threshhold  # I don't know when mask got inverted, but it did
             masked_input = torch.where(mask_bool, latents, mask_latents)
         else:
@@ -694,44 +692,63 @@ class InpaintExt(ExtensionBase):
 
     @modifier("pre_denoise_loop")
     def init_tensors(self, ctx):
-        #if self.mask is None:
-        #    self.mask = torch.ones_like(ctx.latents[:1, :1])
-        #if self.masked_latents is None:
-        #    self.masked_latents = torch.zeros_like(ctx.latents[:1])
-        self.mask.to(device=ctx.latents.device, dtype=ctx.latents.dtype)
-        self.masked_latents.to(device=ctx.latents.device, dtype=ctx.latents.dtype)
+        if self._is_inpaint_model(ctx.unet):
+            if self.mask is None:
+                self.mask = torch.ones_like(ctx.latents[:1, :1])
+            self.mask.to(device=ctx.latents.device, dtype=ctx.latents.dtype)
+
+            if self.masked_latents is None:
+                self.masked_latents = torch.zeros_like(ctx.latents[:1])
+            self.masked_latents.to(device=ctx.latents.device, dtype=ctx.latents.dtype)
+
+        else:
+            #self.orig_latents = ctx.orig_latents
+            self.noise = ctx.noise
+            if self.noise is None:
+                self.noise = torch.randn(
+                    ctx.orig_latents.shape,
+                    dtype=torch.float32,
+                    device="cpu",
+                    generator=torch.Generator(device="cpu").manual_seed(ctx.seed),
+                ).to(device=ctx.orig_latents.device, dtype=ctx.orig_latents.dtype)
 
     @modifier("pre_step") # last?
     def apply_mask_to_latents(self, ctx):
-        if self._is_inpaint_model(ctx.unet):
+        if self._is_inpaint_model(ctx.unet) or self.mask is None:
             return
-        # ctx.timesteps[ctx.step_index]
-        ctx.latents = self._apply_mask(ctx.latents, ctx.timestep)
+        ctx.latents = self._apply_mask(ctx, ctx.latents, ctx.timestep)
 
     @modifier("pre_unet_forward", order="last")
-    def append_inpaint_layers(self, ctx, step_index):
-        b_mask = torch.cat([self.mask] * ctx.batch_size)
-        b_masked_latents = torch.cat([self.masked_latents] * ctx.batch_size)
-        ctx.latent_model_input = torch.cat(
-            [unet_kwargs.latent_model_input, b_mask, b_masked_latents],
+    def append_inpaint_layers(self, ctx):
+        if not self._is_inpaint_model(ctx.unet):
+            return
+
+        batch_size = ctx.unet_kwargs.sample.shape[0]
+        b_mask = torch.cat([self.mask] * batch_size)
+        b_masked_latents = torch.cat([self.masked_latents] * batch_size)
+        ctx.unet_kwargs.sample = torch.cat(
+            [ctx.unet_kwargs.sample, b_mask, b_masked_latents],
             dim=1,
         )
 
     @modifier("post_step", order="first")
     def apply_mask_to_preview(self, ctx):
-        if is_inpaint_model(ctx.unet):
+        if self._is_inpaint_model(ctx.unet) or self.mask is None:
             return
 
         timestep = ctx.scheduler.timesteps[-1]
         if hasattr(ctx.step_output, "denoised"):
-            ctx.step_output.denoised = self._apply_mask(ctx.step_output.denoised, timestep)
+            ctx.step_output.denoised = self._apply_mask(ctx, ctx.step_output.denoised, timestep)
         elif hasattr(ctx.step_output, "pred_original_sample"):
-            ctx.step_output.pred_original_sample = self._apply_mask(ctx.step_output.pred_original_sample, timestep)
+            ctx.step_output.pred_original_sample = self._apply_mask(ctx, ctx.step_output.pred_original_sample, timestep)
         else:
-            ctx.step_output.pred_original_sample = self._apply_mask(ctx.step_output.prev_sample, timestep)
+            ctx.step_output.pred_original_sample = self._apply_mask(ctx, ctx.step_output.prev_sample, timestep)
 
     @modifier("post_denoise_loop") # last?
     def restore_unmasked(self, ctx):
+        if self.mask is None:
+            return
+
         # restore unmasked part after the last step is completed
         # in-process masking happens before each step
         if self.is_gradient_mask:
@@ -764,11 +781,11 @@ class PreviewExt(ExtensionBase):
     @modifier("post_step", order="last")
     def step_preview(self, ctx):
         if hasattr(ctx.step_output, "denoised"):
-            predicted_original = self._apply_mask(ctx.step_output.denoised, ctx.timestep)
+            predicted_original = ctx.step_output.denoised
         elif hasattr(ctx.step_output, "pred_original_sample"):
-            predicted_original = self._apply_mask(ctx.step_output.pred_original_sample, ctx.timestep)
+            predicted_original = ctx.step_output.pred_original_sample
         else:
-            predicted_original = self._apply_mask(ctx.step_output.prev_sample, ctx.timestep)
+            predicted_original = ctx.step_output.prev_sample
 
 
         self.callback(
@@ -891,7 +908,7 @@ class ExtensionsManager:
                 if inj_info.type == "modifier":
                     if inj_info.name not in self.injections[inj_info.type]:
                         self.injections[inj_info.type][inj_info.name] = InjectionPoint(inj_info.name)
-                    self.injections[inj_info.type][inj_info.name].add(inj_func)
+                    self.injections[inj_info.type][inj_info.name].add(inj_func, inj_info.order)
                 else:
                     if inj_info.name in self.injections[inj_info.type]:
                         raise Exception(f"Already overloaded - {inj_info.name}")
