@@ -825,6 +825,40 @@ class RescaleCFGExt(ExtensionBase):
             )
 
 
+class T2IAdapterExt(ExtensionBase):
+    adapter_state: List[torch.Tensor] = Field() # TODO:  why here was dict before
+    weight: Union[float, List[float]] = Field(default=1.0)
+    begin_step_percent: float = Field(default=0.0)
+    end_step_percent: float = Field(default=1.0)
+
+    def __init__(self, adapter_state, weight, begin_step_percent, end_step_percent, priority):
+        super().__init__(priority=priority)
+        self.adapter_state = adapter_state
+        self.weight = weight
+        self.begin_step_percent = begin_step_percent
+        self.end_step_percent = end_step_percent
+
+    @modifier("pre_unet_forward")
+    def pre_unet_step(self, ctx):
+        # skip if model not active in current step
+        total_steps = len(ctx.timesteps)
+        first_step = math.floor(self.begin_step_percent * total_steps)
+        last_step  = math.ceil(self.end_step_percent * total_steps)
+        if ctx.step_index < first_step or ctx.step_index > last_step:
+            return
+
+        weight = self.weight
+        if isinstance(weight, list):
+            weight = weight[ctx.step_index]
+
+        # TODO: conditioning_mode?
+        if ctx.unet_kwargs.down_intrablock_additional_residuals is None:
+            ctx.unet_kwargs.down_intrablock_additional_residuals = [v * weight for v in self.adapter_state]
+        else:
+            for i, value in enumerate(self.adapter_state):
+                ctx.unet_kwargs.down_intrablock_additional_residuals[i] += value * weight
+
+
 class ExtModifiersApi(ABC):
     def pre_denoise_loop(self, ctx):
         pass
@@ -1003,9 +1037,17 @@ class StableDiffusionBackend:
         if mask is not None or is_inpainting_model(ctx.unet):
             ext_controller.add_extension(InpaintExt(mask, masked_latents, is_gradient_mask, priority=200))
 
-        #if t2i_adapter_data is not None:
-        #    for t2i_adapter in t2i_adapter_data:
-        #        ext_controller.add_extension(T2IAdapterExt(t2i_adapter, priority=100))
+        if t2i_adapter_data is not None:
+            for t2i_adapter in t2i_adapter_data:
+                ext_controller.add_extension(
+                    T2IAdapterExt(
+                        adapter_state=t2i_adapter.adapter_state,
+                        weight=t2i_adapter.weight,
+                        begin_step_percent=t2i_adapter.begin_step_percent,
+                        end_step_percent=t2i_adapter.end_step_percent,
+                        priority=100,
+                    )
+                )
 
         #if ip_adapter_data is not None:
         #    for ip_adapter in ip_adapter_data:
