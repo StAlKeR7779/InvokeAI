@@ -9,6 +9,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin, SchedulerOutpu
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode, TextConditioningData
+    from invokeai.backend.stable_diffusion.extensions_manager import ExtensionsManager
 
 
 @dataclass
@@ -67,6 +68,9 @@ class DenoiseInputs:
 
     # Class of attention processor that is used.
     attention_processor_cls: Type[Any]
+
+    # Extensions manager
+    ext_manager: ExtensionsManager
 
 
 @dataclass

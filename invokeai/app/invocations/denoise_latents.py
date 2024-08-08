@@ -885,6 +885,7 @@ class DenoiseLatentsInvocation(BaseInvocation):
                 scheduler_step_kwargs=scheduler_step_kwargs,
                 conditioning_data=conditioning_data,
                 attention_processor_cls=CustomAttnProcessor2_0,
+                ext_manager=ext_manager,
             ),
             unet=None,
             scheduler=scheduler,
