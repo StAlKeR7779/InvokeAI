@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import partial
 from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
@@ -11,13 +12,53 @@ from invokeai.backend.util.original_weights_storage import OriginalWeightsStorag
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
-    from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
     from invokeai.backend.stable_diffusion.extensions.base import CallbackFunctionWithMetadata, ExtensionBase
+
+
+class CallbackApi:
+    def __init__(self, handler: Callable[..., None]):
+        self._handler = handler
+
+    def setup(self, ctx: DenoiseContext):
+        pass
+
+    def pre_denoise_loop(self, ctx: DenoiseContext):
+        pass
+
+    def post_denoise_loop(self, ctx: DenoiseContext):
+        pass
+
+    def pre_step(self, ctx: DenoiseContext):
+        pass
+
+    def post_step(self, ctx: DenoiseContext):
+        pass
+
+    def pre_unet_forward(self, ctx: DenoiseContext):
+        pass
+
+    def post_unet_forward(self, ctx: DenoiseContext):
+        pass
+
+    def post_combine_noise_preds(self, ctx: DenoiseContext):
+        pass
+
+    def __getattribute__(self, name: str):
+        if name.startswith("_"):
+            return super().__getattribute__(name)
+
+        func = type(self).__dict__.get(name, None)
+        if func is not None:
+            return partial(self._handler, func.__qualname__)
+
+        raise AttributeError(f"Callback \"{name}\" is not defined!")
 
 
 class ExtensionsManager:
     def __init__(self, is_canceled: Optional[Callable[[], bool]] = None):
         self._is_canceled = is_canceled
+
+        self.callback = CallbackApi(self._run_callback)
 
         # A list of extensions in the order that they were added to the ExtensionsManager.
         self._extensions: List[ExtensionBase] = []
@@ -33,24 +74,24 @@ class ExtensionsManager:
 
         # Fill the ordered callbacks dictionary.
         for extension in self._extensions:
-            for callback_type, callbacks in extension.get_callbacks().items():
-                if callback_type not in self._ordered_callbacks:
-                    self._ordered_callbacks[callback_type] = []
-                self._ordered_callbacks[callback_type].extend(callbacks)
+            for callback_id, callbacks in extension.get_callbacks().items():
+                if callback_id not in self._ordered_callbacks:
+                    self._ordered_callbacks[callback_id] = []
+                self._ordered_callbacks[callback_id].extend(callbacks)
 
         # Sort each callback list.
-        for callback_type, callbacks in self._ordered_callbacks.items():
+        for callback_id, callbacks in self._ordered_callbacks.items():
             # Note that sorted() is stable, so if two callbacks have the same order, the order that they extensions were
             # added will be preserved.
-            self._ordered_callbacks[callback_type] = sorted(callbacks, key=lambda x: x.metadata.order)
+            self._ordered_callbacks[callback_id] = sorted(callbacks, key=lambda x: x.metadata.order)
 
-    def run_callback(self, callback_type: ExtensionCallbackType, ctx: DenoiseContext):
+    def _run_callback(self, callback_id: str, *args, **kwargs):
         if self._is_canceled and self._is_canceled():
             raise CanceledException
 
-        callbacks = self._ordered_callbacks.get(callback_type, [])
+        callbacks = self._ordered_callbacks.get(callback_id, [])
         for cb in callbacks:
-            cb.function(ctx)
+            cb.function(*args, **kwargs)
 
     @contextmanager
     def patch_extensions(self, ctx: DenoiseContext):

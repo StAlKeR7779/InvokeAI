@@ -11,8 +11,8 @@ from invokeai.app.invocations.constants import LATENT_SCALE_FACTOR
 from invokeai.app.util.controlnet_utils import CONTROLNET_MODE_VALUES, CONTROLNET_RESIZE_VALUES, prepare_control_image
 from invokeai.backend.stable_diffusion.denoise_context import UNetKwargs
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode
-from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
 from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase, callback
+from invokeai.backend.stable_diffusion.extensions_manager import CallbackApi
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
@@ -51,7 +51,7 @@ class ControlNetExt(ExtensionBase):
         finally:
             self._model.set_attn_processor(original_processors)
 
-    @callback(ExtensionCallbackType.PRE_DENOISE_LOOP)
+    @callback(CallbackApi.pre_denoise_loop)
     def resize_image(self, ctx: DenoiseContext):
         _, _, latent_height, latent_width = ctx.latents.shape
         image_height = latent_height * LATENT_SCALE_FACTOR
@@ -68,7 +68,7 @@ class ControlNetExt(ExtensionBase):
             resize_mode=self._resize_mode,
         )
 
-    @callback(ExtensionCallbackType.PRE_UNET)
+    @callback(CallbackApi.pre_unet_forward)
     def pre_unet_step(self, ctx: DenoiseContext):
         # skip if model not active in current step
         total_steps = len(ctx.inputs.timesteps)

@@ -6,8 +6,8 @@ import einops
 import torch
 from diffusers import UNet2DConditionModel
 
-from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
 from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase, callback
+from invokeai.backend.stable_diffusion.extensions_manager import CallbackApi
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
@@ -72,7 +72,7 @@ class InpaintExt(ExtensionBase):
             masked_input = torch.lerp(latents, mask_latents.to(dtype=latents.dtype), mask.to(dtype=latents.dtype))
         return masked_input
 
-    @callback(ExtensionCallbackType.PRE_DENOISE_LOOP)
+    @callback(CallbackApi.pre_denoise_loop)
     def init_tensors(self, ctx: DenoiseContext):
         if not self._is_normal_model(ctx.unet):
             raise ValueError(
@@ -95,13 +95,13 @@ class InpaintExt(ExtensionBase):
             ).to(device=ctx.latents.device, dtype=ctx.latents.dtype)
 
     # Use negative order to make extensions with default order work with patched latents
-    @callback(ExtensionCallbackType.PRE_STEP, order=-100)
+    @callback(CallbackApi.pre_step, order=-100)
     def apply_mask_to_initial_latents(self, ctx: DenoiseContext):
         ctx.latents = self._apply_mask(ctx, ctx.latents, ctx.timestep)
 
     # TODO: redo this with preview events rewrite
     # Use negative order to make extensions with default order work with patched latents
-    @callback(ExtensionCallbackType.POST_STEP, order=-100)
+    @callback(CallbackApi.post_step, order=-100)
     def apply_mask_to_step_output(self, ctx: DenoiseContext):
         timestep = ctx.scheduler.timesteps[-1]
         if hasattr(ctx.step_output, "denoised"):
@@ -112,7 +112,7 @@ class InpaintExt(ExtensionBase):
             ctx.step_output.pred_original_sample = self._apply_mask(ctx, ctx.step_output.prev_sample, timestep)
 
     # Restore unmasked part after the last step is completed
-    @callback(ExtensionCallbackType.POST_DENOISE_LOOP)
+    @callback(CallbackApi.post_denoise_loop)
     def restore_unmasked(self, ctx: DenoiseContext):
         if self._is_gradient_mask:
             ctx.latents = torch.where(self._mask < 1, ctx.latents, ctx.inputs.orig_latents)

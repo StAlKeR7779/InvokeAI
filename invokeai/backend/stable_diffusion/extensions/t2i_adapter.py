@@ -10,8 +10,8 @@ from PIL.Image import Image
 from invokeai.app.util.controlnet_utils import prepare_control_image
 from invokeai.backend.model_manager import BaseModelType
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode
-from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
 from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase, callback
+from invokeai.backend.stable_diffusion.extensions_manager import CallbackApi
 
 if TYPE_CHECKING:
     from invokeai.app.invocations.model import ModelIdentifierField
@@ -51,7 +51,7 @@ class T2IAdapterExt(ExtensionBase):
         else:
             raise ValueError(f"Unexpected T2I-Adapter base model type: '{model_config.base}'.")
 
-    @callback(ExtensionCallbackType.SETUP)
+    @callback(CallbackApi.setup)
     def setup(self, ctx: DenoiseContext):
         t2i_model: T2IAdapter
         with self._node_context.models.load(self._model_id) as t2i_model:
@@ -96,7 +96,7 @@ class T2IAdapterExt(ExtensionBase):
 
         return model(t2i_image)
 
-    @callback(ExtensionCallbackType.PRE_UNET)
+    @callback(CallbackApi.pre_unet_forward)
     def pre_unet_step(self, ctx: DenoiseContext):
         # skip if model not active in current step
         total_steps = len(ctx.inputs.timesteps)

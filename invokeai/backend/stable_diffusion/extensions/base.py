@@ -8,13 +8,12 @@ from diffusers import UNet2DConditionModel
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
-    from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
     from invokeai.backend.util.original_weights_storage import OriginalWeightsStorage
 
 
 @dataclass
 class CallbackMetadata:
-    callback_type: ExtensionCallbackType
+    callback_id: str
     order: int
 
 
@@ -24,10 +23,10 @@ class CallbackFunctionWithMetadata:
     function: Callable[[DenoiseContext], None]
 
 
-def callback(callback_type: ExtensionCallbackType, order: int = 0):
+def callback(callback: Callable[..., None], order: int = 0):
     def _decorator(function):
         function._ext_metadata = CallbackMetadata(
-            callback_type=callback_type,
+            callback_id=callback.__qualname__,
             order=order,
         )
         return function
@@ -37,16 +36,16 @@ def callback(callback_type: ExtensionCallbackType, order: int = 0):
 
 class ExtensionBase:
     def __init__(self):
-        self._callbacks: Dict[ExtensionCallbackType, List[CallbackFunctionWithMetadata]] = {}
+        self._callbacks: Dict[str, List[CallbackFunctionWithMetadata]] = {}
 
         # Register all of the callback methods for this instance.
         for func_name in dir(self):
             func = getattr(self, func_name)
             metadata = getattr(func, "_ext_metadata", None)
             if metadata is not None and isinstance(metadata, CallbackMetadata):
-                if metadata.callback_type not in self._callbacks:
-                    self._callbacks[metadata.callback_type] = []
-                self._callbacks[metadata.callback_type].append(CallbackFunctionWithMetadata(metadata, func))
+                if metadata.callback_id not in self._callbacks:
+                    self._callbacks[metadata.callback_id] = []
+                self._callbacks[metadata.callback_id].append(CallbackFunctionWithMetadata(metadata, func))
 
     def get_callbacks(self):
         return self._callbacks

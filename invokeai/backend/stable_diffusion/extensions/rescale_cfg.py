@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
 from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase, callback
+from invokeai.backend.stable_diffusion.extensions_manager import CallbackApi
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
@@ -26,7 +26,7 @@ class RescaleCFGExt(ExtensionBase):
         x_final = multiplier * x_rescaled + (1.0 - multiplier) * total_noise_pred
         return x_final
 
-    @callback(ExtensionCallbackType.POST_COMBINE_NOISE_PREDS)
+    @callback(CallbackApi.post_combine_noise_preds)
     def rescale_noise_pred(self, ctx: DenoiseContext):
         if self._rescale_multiplier > 0:
             ctx.noise_pred = self._rescale_cfg(

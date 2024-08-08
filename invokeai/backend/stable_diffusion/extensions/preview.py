@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
 from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase, callback
+from invokeai.backend.stable_diffusion.extensions_manager import CallbackApi
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
@@ -29,7 +29,7 @@ class PreviewExt(ExtensionBase):
         self.callback = callback
 
     # do last so that all other changes shown
-    @callback(ExtensionCallbackType.PRE_DENOISE_LOOP, order=1000)
+    @callback(CallbackApi.pre_denoise_loop, order=1000)
     def initial_preview(self, ctx: DenoiseContext):
         self.callback(
             PipelineIntermediateState(
@@ -42,7 +42,7 @@ class PreviewExt(ExtensionBase):
         )
 
     # do last so that all other changes shown
-    @callback(ExtensionCallbackType.POST_STEP, order=1000)
+    @callback(CallbackApi.post_step, order=1000)
     def step_preview(self, ctx: DenoiseContext):
         if hasattr(ctx.step_output, "denoised"):
             predicted_original = ctx.step_output.denoised

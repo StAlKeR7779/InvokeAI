@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from diffusers import UNet2DConditionModel
 
-from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
 from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase, callback
+from invokeai.backend.stable_diffusion.extensions_manager import CallbackApi
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
@@ -55,7 +55,7 @@ class InpaintModelExt(ExtensionBase):
         """
         return unet.conv_in.in_channels == 9
 
-    @callback(ExtensionCallbackType.PRE_DENOISE_LOOP)
+    @callback(CallbackApi.pre_denoise_loop)
     def init_tensors(self, ctx: DenoiseContext):
         if not self._is_inpaint_model(ctx.unet):
             raise ValueError("InpaintModelExt should be used only on inpaint models!")
@@ -69,7 +69,7 @@ class InpaintModelExt(ExtensionBase):
         self._masked_latents = self._masked_latents.to(device=ctx.latents.device, dtype=ctx.latents.dtype)
 
     # Do last so that other extensions works with normal latents
-    @callback(ExtensionCallbackType.PRE_UNET, order=1000)
+    @callback(CallbackApi.pre_unet_forward, order=1000)
     def append_inpaint_layers(self, ctx: DenoiseContext):
         batch_size = ctx.unet_kwargs.sample.shape[0]
         b_mask = torch.cat([self._mask] * batch_size)
@@ -80,7 +80,7 @@ class InpaintModelExt(ExtensionBase):
         )
 
     # Restore unmasked part as inpaint model can change unmasked part slightly
-    @callback(ExtensionCallbackType.POST_DENOISE_LOOP)
+    @callback(CallbackApi.post_denoise_loop)
     def restore_unmasked(self, ctx: DenoiseContext):
         if self._is_gradient_mask:
             ctx.latents = torch.where(self._mask > 0, ctx.latents, ctx.inputs.orig_latents)

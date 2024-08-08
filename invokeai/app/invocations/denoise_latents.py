@@ -57,7 +57,6 @@ from invokeai.backend.stable_diffusion.diffusion.conditioning_data import (
 )
 from invokeai.backend.stable_diffusion.diffusion.custom_atttention import CustomAttnProcessor2_0
 from invokeai.backend.stable_diffusion.diffusion_backend import StableDiffusionBackend
-from invokeai.backend.stable_diffusion.extension_callback_type import ExtensionCallbackType
 from invokeai.backend.stable_diffusion.extensions.controlnet import ControlNetExt
 from invokeai.backend.stable_diffusion.extensions.freeu import FreeUExt
 from invokeai.backend.stable_diffusion.extensions.inpaint import InpaintExt
@@ -901,7 +900,7 @@ class DenoiseLatentsInvocation(BaseInvocation):
             self.parse_t2i_adapter_field(exit_stack, context, self.t2i_adapter, ext_manager)
 
             # ext: t2i/ip adapter
-            ext_manager.run_callback(ExtensionCallbackType.SETUP, denoise_ctx)
+            ext_manager.callback.setup(denoise_ctx)
 
             unet_info = context.models.load(self.unet.unet)
             assert isinstance(unet_info.model, UNet2DConditionModel)
