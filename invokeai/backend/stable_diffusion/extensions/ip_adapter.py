@@ -114,7 +114,7 @@ class IPAdapterExt(ExtensionBase):
             self.mask, latent_height, latent_width, dtype=ctx.inputs.orig_latents.dtype
         )
         self.mask_tensor = self._prepare_masks(
-            [tmp],
+            tmp,
             max_downscale_factor=8,
             device=ctx.inputs.orig_latents.device,
             dtype=ctx.inputs.orig_latents.dtype,
@@ -147,22 +147,16 @@ class IPAdapterExt(ExtensionBase):
         return resized_mask
 
     def _prepare_masks(
-        self, masks: list[torch.Tensor], max_downscale_factor: int, device: torch.device, dtype: torch.dtype
+        self, mask_tensor: torch.Tensor, max_downscale_factor: int, device: torch.device, dtype: torch.dtype
     ) -> dict[int, torch.Tensor]:
-        """Prepare the masks for the IP-Adapter attention."""
-        # Concatenate the masks so that they can be processed more efficiently.
-        mask_tensor = torch.cat(masks, dim=1)
-
-        mask_tensor = mask_tensor.to(device=device, dtype=dtype)
-
+        mask_tensor = mask_tensor.to(device=device, dtype=dtype, copy=True)
         masks_by_seq_len: dict[int, torch.Tensor] = {}
 
         # Downsample the spatial dimensions by factors of 2 until max_downscale_factor is reached.
         downscale_factor = 1
         while downscale_factor <= max_downscale_factor:
             b, num_ip_adapters, h, w = mask_tensor.shape
-            # Assert that the batch size is 1, because I haven't thought through batch handling for this feature yet.
-            assert b == 1
+            assert b == 1 and num_ip_adapters == 1
 
             # The IP-Adapters are applied in the cross-attention layers, where the query sequence length is the h * w of
             # the spatial features.
@@ -184,48 +178,41 @@ class IPAdapterExt(ExtensionBase):
 
 
     @callback(CallbackApi.post_run_attention)
-    def post_run_attention(self, ctx: AttentionContext):
-        if ctx.module_key.endswith("attn1.processor"):
+    def post_run_attention(self, ctx: AttentionContext, denoise_ctx: DenoiseContext):
+        # skip if no weights for this attention
+        if str(ctx.module_id) not in self.model.attn_weights._weights:
             return
 
-        print(f"post_run_attention")
+        # skip if adapter not marked to work on this attention
+        if not any(target_block in ctx.module_key for target_block in self.target_blocks):
+            return
+
         # skip if model not active in current step
-        total_steps = len(ctx.denoise_ctx.inputs.timesteps)
+        total_steps = len(denoise_ctx.inputs.timesteps)
         first_step = math.floor(self.begin_step_percent * total_steps)
         last_step = math.ceil(self.end_step_percent * total_steps)
-        if ctx.denoise_ctx.step_index < first_step or ctx.denoise_ctx.step_index > last_step:
+        if denoise_ctx.step_index < first_step or denoise_ctx.step_index > last_step:
             return
 
         weight = self.weight
         if isinstance(weight, List):
-            weight = weight[ctx.denoise_ctx.step_index]
+            weight = weight[denoise_ctx.step_index]
 
         if weight == 0:
             return
 
-        skip = True
-        for target_block in self.target_blocks:
-            if target_block in ctx.module_key:
-                skip = False
-                break
-
-        if skip:
-            return
-
-        if ctx.denoise_ctx.conditioning_mode == ConditioningMode.Both:
+        if denoise_ctx.conditioning_mode == ConditioningMode.Both:
             embeds = torch.stack(
                 [self.conditioning.uncond_image_prompt_embeds, self.conditioning.cond_image_prompt_embeds]
             )
-        elif ctx.denoise_ctx.conditioning_mode == ConditioningMode.Negative:
+        elif denoise_ctx.conditioning_mode == ConditioningMode.Negative:
             embeds = torch.stack([self.conditioning.uncond_image_prompt_embeds])
-        else:  # elif ctx.denoise_ctx.conditioning_mode == ConditioningMode.Positive:
+        else:  # elif denoise_ctx.conditioning_mode == ConditioningMode.Positive:
             embeds = torch.stack([self.conditioning.cond_image_prompt_embeds])
 
         ip_attn_weights = self.model.attn_weights.get_attention_processor_weights(ctx.module_id)
         ip_key = ip_attn_weights.to_k_ip(embeds)
         ip_value = ip_attn_weights.to_v_ip(embeds)
-
-        print(f"{ctx.denoise_ctx.conditioning_mode=} {embeds.shape=} {self.conditioning.uncond_image_prompt_embeds.shape=} {self.conditioning.cond_image_prompt_embeds.shape=}")
 
         ip_hidden_states = ctx.attention_processor.run_attention(
             attn=ctx.attn,
@@ -238,5 +225,4 @@ class IPAdapterExt(ExtensionBase):
         mask = self.mask_tensor[ctx.hidden_states.shape[1]].squeeze(0)
 
         # Expected ip_hidden_states shape: (batch_size, query_seq_len, num_heads * head_dim)
-        print(f"{ctx.hidden_states.shape=} {ip_hidden_states.shape=} {mask.shape=}")
         ctx.hidden_states += weight * ip_hidden_states * mask

@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 class AttentionContext:
     module_id: int
     module_key: str
-    denoise_ctx: DenoiseContext
     attention_processor: CustomAttentionProcessor
     is_cross_attention: bool
 
@@ -124,7 +123,6 @@ class CustomAttnProcessorNew:
             assert self.module_key is not None and self.module_id is not None
 
         ctx = AttentionContext(
-            denoise_ctx=denoise_ctx,
             module_id=self.module_id,
             module_key=self.module_key,
             # share only reference to run_attention?
@@ -157,10 +155,10 @@ class CustomAttnProcessorNew:
 
         # ext: regional prompts(attention couple)
         if denoise_ctx is not None:
-            denoise_ctx.inputs.ext_manager.callback.pre_prepare_attention_mask(ctx)
+            denoise_ctx.inputs.ext_manager.callback.pre_prepare_attention_mask(ctx, denoise_ctx)
         ctx.attention_mask = ctx.attn.prepare_attention_mask(ctx.attention_mask, ctx.key_length, ctx.batch_size)
         if denoise_ctx is not None:
-            denoise_ctx.inputs.ext_manager.callback.post_prepare_attention_mask(ctx)
+            denoise_ctx.inputs.ext_manager.callback.post_prepare_attention_mask(ctx, denoise_ctx)
 
         if ctx.attn.group_norm is not None:
             ctx.hidden_states = ctx.attn.group_norm(ctx.hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -176,7 +174,7 @@ class CustomAttnProcessorNew:
         ctx.value = ctx.attn.to_v(ctx.encoder_hidden_states)
 
         if denoise_ctx is not None:
-            denoise_ctx.inputs.ext_manager.callback.pre_run_attention(ctx)
+            denoise_ctx.inputs.ext_manager.callback.pre_run_attention(ctx, denoise_ctx)
         ctx.hidden_states = self.run_attention(
             attn=ctx.attn,
             query=ctx.query,
@@ -188,7 +186,7 @@ class CustomAttnProcessorNew:
         # ext: ip adapter
         if denoise_ctx is not None:
             print("post_run_attention")
-            denoise_ctx.inputs.ext_manager.callback.post_run_attention(ctx)
+            denoise_ctx.inputs.ext_manager.callback.post_run_attention(ctx, denoise_ctx)
 
         # linear proj
         ctx.hidden_states = ctx.attn.to_out[0](ctx.hidden_states)
