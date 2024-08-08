@@ -12,6 +12,7 @@ from invokeai.backend.util.original_weights_storage import OriginalWeightsStorag
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
+    from invokeai.backend.stable_diffusion.diffusion.custom_atttention import AttentionContext
     from invokeai.backend.stable_diffusion.extensions.base import CallbackFunctionWithMetadata, ExtensionBase
 
 
@@ -41,6 +42,18 @@ class CallbackApi:
         pass
 
     def post_combine_noise_preds(self, ctx: DenoiseContext):
+        pass
+
+    def pre_prepare_attention_mask(self, ctx: AttentionContext):
+        pass
+
+    def post_prepare_attention_mask(self, ctx: AttentionContext):
+        pass
+
+    def pre_run_attention(self, ctx: AttentionContext):
+        pass
+
+    def post_run_attention(self, ctx: AttentionContext):
         pass
 
     def __getattribute__(self, name: str):

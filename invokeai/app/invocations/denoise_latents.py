@@ -56,11 +56,13 @@ from invokeai.backend.stable_diffusion.diffusion.conditioning_data import (
     TextConditioningRegions,
 )
 from invokeai.backend.stable_diffusion.diffusion.custom_atttention import CustomAttnProcessor2_0
+from invokeai.backend.stable_diffusion.diffusion.custom_attention_new import CustomAttnProcessorNew
 from invokeai.backend.stable_diffusion.diffusion_backend import StableDiffusionBackend
 from invokeai.backend.stable_diffusion.extensions.controlnet import ControlNetExt
 from invokeai.backend.stable_diffusion.extensions.freeu import FreeUExt
 from invokeai.backend.stable_diffusion.extensions.inpaint import InpaintExt
 from invokeai.backend.stable_diffusion.extensions.inpaint_model import InpaintModelExt
+from invokeai.backend.stable_diffusion.extensions.ip_adapter import IPAdapterExt
 from invokeai.backend.stable_diffusion.extensions.lora import LoRAExt
 from invokeai.backend.stable_diffusion.extensions.preview import PreviewExt
 from invokeai.backend.stable_diffusion.extensions.rescale_cfg import RescaleCFGExt
@@ -529,6 +531,45 @@ class DenoiseLatentsInvocation(BaseInvocation):
                 )
             )
 
+    @staticmethod
+    def parse_ip_adapter_field(
+        exit_stack: ExitStack,
+        context: InvocationContext,
+        ip_adapters: List[IPAdapterField],
+        ext_manager: ExtensionsManager,
+    ) -> None:
+        if ip_adapters is None:
+            return
+
+        if not isinstance(ip_adapters, list):
+            ip_adapters = [ip_adapters]
+
+        for single_ip_adapter in ip_adapters:
+            # `single_ip_adapter.image` could be a list or a single ImageField. Normalize to a list here.
+            single_ipa_image_fields = single_ip_adapter.image
+            if not isinstance(single_ipa_image_fields, list):
+                single_ipa_image_fields = [single_ipa_image_fields]
+
+            single_ipa_images = [context.images.get_pil(image.image_name) for image in single_ipa_image_fields]
+
+            mask_field = single_ip_adapter.mask
+            mask = context.tensors.load(mask_field.tensor_name) if mask_field is not None else None
+
+            ext_manager.add_extension(
+                IPAdapterExt(
+                    node_context=context,
+                    exit_stack=exit_stack,
+                    model_id=single_ip_adapter.ip_adapter_model,
+                    image_encoder_model_id=single_ip_adapter.image_encoder_model,
+                    images=single_ipa_images,
+                    weight=single_ip_adapter.weight,
+                    target_blocks=single_ip_adapter.target_blocks,
+                    begin_step_percent=single_ip_adapter.begin_step_percent,
+                    end_step_percent=single_ip_adapter.end_step_percent,
+                    mask=mask,
+                )
+            )
+
     def prep_ip_adapter_image_prompts(
         self,
         context: InvocationContext,
@@ -883,7 +924,7 @@ class DenoiseLatentsInvocation(BaseInvocation):
                 seed=seed,
                 scheduler_step_kwargs=scheduler_step_kwargs,
                 conditioning_data=conditioning_data,
-                attention_processor_cls=CustomAttnProcessor2_0,
+                attention_processor_cls=CustomAttnProcessorNew,
                 ext_manager=ext_manager,
             ),
             unet=None,
@@ -898,6 +939,7 @@ class DenoiseLatentsInvocation(BaseInvocation):
             #    ext_manager.add_extension(ext)
             self.parse_controlnet_field(exit_stack, context, self.control, ext_manager)
             self.parse_t2i_adapter_field(exit_stack, context, self.t2i_adapter, ext_manager)
+            self.parse_ip_adapter_field(exit_stack, context, self.ip_adapter, ext_manager)
 
             # ext: t2i/ip adapter
             ext_manager.callback.setup(denoise_ctx)

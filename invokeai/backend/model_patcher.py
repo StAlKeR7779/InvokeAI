@@ -46,7 +46,10 @@ class ModelPatcher:
         unet_orig_processors = unet.attn_processors
 
         # create separate instance for each attention, to be able modify each attention separately
-        unet_new_processors = {key: processor_cls() for key in unet_orig_processors.keys()}
+        if processor_cls.__name__ == "CustomAttnProcessorNew":
+            unet_new_processors = {key: processor_cls(i, key) for i, key in enumerate(unet_orig_processors.keys())}
+        else:
+            unet_new_processors = {key: processor_cls() for key in unet_orig_processors.keys()}
         try:
             unet.set_attn_processor(unet_new_processors)
             yield None

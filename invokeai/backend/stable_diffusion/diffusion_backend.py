@@ -115,6 +115,7 @@ class StableDiffusionBackend:
             encoder_hidden_states=None,  # set later by conditoning
             cross_attention_kwargs=dict(  # noqa: C408
                 percent_through=ctx.step_index / len(ctx.inputs.timesteps),
+                denoise_ctx=ctx,
             ),
         )
 
