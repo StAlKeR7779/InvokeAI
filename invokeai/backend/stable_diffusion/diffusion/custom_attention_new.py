@@ -160,7 +160,7 @@ class CustomAttnProcessorNew:
             if ctx.attention_mask is None:
                 ctx.attention_mask = prompt_region_attention_mask
             else:
-                ctx.attention_mask += prompt_region_attention_mask
+                ctx.attention_mask = prompt_region_attention_mask + ctx.attention_mask
 
         # ext: regional prompts(attention couple)
         if denoise_ctx is not None:
