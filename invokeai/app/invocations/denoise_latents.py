@@ -64,6 +64,7 @@ from invokeai.backend.stable_diffusion.extensions.inpaint import InpaintExt
 from invokeai.backend.stable_diffusion.extensions.inpaint_model import InpaintModelExt
 from invokeai.backend.stable_diffusion.extensions.ip_adapter import IPAdapterExt
 from invokeai.backend.stable_diffusion.extensions.lora import LoRAExt
+from invokeai.backend.stable_diffusion.extensions.multi_diffusion import MultiDiffusionExt
 from invokeai.backend.stable_diffusion.extensions.preview import PreviewExt
 from invokeai.backend.stable_diffusion.extensions.rescale_cfg import RescaleCFGExt
 from invokeai.backend.stable_diffusion.extensions.seamless import SeamlessExt
@@ -910,6 +911,14 @@ class DenoiseLatentsInvocation(BaseInvocation):
             ext_manager.add_extension(InpaintModelExt(mask, masked_latents, is_gradient_mask))
         elif mask is not None:
             ext_manager.add_extension(InpaintExt(mask, is_gradient_mask))
+
+        ext_manager.add_extension(
+            MultiDiffusionExt(
+                tile_width=1024,
+                tile_height=1024,
+                tile_overlap=32,
+            )
+        )
 
         # Initialize context for modular denoise
         latents = latents.to(device=device, dtype=dtype)
