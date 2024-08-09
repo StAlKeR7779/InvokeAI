@@ -38,7 +38,7 @@ def gaussian_blur_2d(img, kernel_size, sigma):
 
     return img
 
-class SAGExt(ExtensionBase):
+class SEGExt(ExtensionBase):
     def __init__(self, scale: float, blur_sigma: float):
         super().__init__()
         self.do_cfg = True
@@ -62,14 +62,15 @@ class SAGExt(ExtensionBase):
 
     @override(OverrideApi.combine_noise_preds)
     def combine_noise_preds(self, orig_function: Callable[[DenoiseContext], torch.Tensor], ctx: DenoiseContext):
-        self._enabled = True
-        self._index = 0
-        backend_obj = orig_function.__self__
-        _, _, self.height, self.width = ctx.latents.shape
-        sag_noise_pred = backend_obj.run_unet(ctx, ConditioningMode.Positive)
-        self._enabled = False
+        try:
+            self._enabled = True
+            self._index = 0
+            _, _, self.height, self.width = ctx.latents.shape
+            seg_noise_pred = ctx.backend.run_unet(ctx, ConditioningMode.Positive)
+        finally:
+            self._enabled = False
 
-        return orig_function(ctx) + self.scale * (ctx.positive_noise_pred - sag_noise_pred)
+        return orig_function(ctx) + self.scale * (ctx.positive_noise_pred - seg_noise_pred)
 
     @callback(CallbackApi.pre_run_attention)
     def do_seg_magic(self, ctx: AttentionContext, denoise_ctx: DenoiseContext):
@@ -77,12 +78,12 @@ class SAGExt(ExtensionBase):
             return
 
         # TODO: normal filtering
-        if "mid" not in ctx.module_key:
+        if "mid" not in ctx.processor.attention_key:
             return
 
         # orig, looks bad
         if False:
-            height = width = math.isqrt(ctx.query.shape[2])
+            height = width = math.isqrt(ctx.query.shape[1])
         else:
             # ctx.query.shape[1] = (height * width) / scale**2
             hw_scale = math.isqrt((self.width * self.height) // ctx.query.shape[1])

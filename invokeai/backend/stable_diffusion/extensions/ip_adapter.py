@@ -131,7 +131,7 @@ class IPAdapterExt(ExtensionBase):
         """
 
         if mask is None:
-            return torch.ones((1, 1, target_height, target_width), dtype=dtype)
+            return torch.ones((1, target_height, target_width), dtype=dtype)
 
         mask = to_standard_float_mask(mask, out_dtype=dtype)
 
@@ -142,7 +142,7 @@ class IPAdapterExt(ExtensionBase):
         # Add a batch dimension to the mask, because torchvision expects shape (batch, channels, h, w).
         mask = mask.unsqueeze(0)  # Shape: (1, h, w) -> (1, 1, h, w)
         resized_mask = tf(mask)
-        return resized_mask
+        return resized_mask.squeeze(0)
 
     def _prepare_masks(
         self, mask_tensor: torch.Tensor, max_downscale_factor: int, device: torch.device, dtype: torch.dtype
@@ -153,14 +153,14 @@ class IPAdapterExt(ExtensionBase):
         # Downsample the spatial dimensions by factors of 2 until max_downscale_factor is reached.
         downscale_factor = 1
         while downscale_factor <= max_downscale_factor:
-            b, num_ip_adapters, h, w = mask_tensor.shape
-            assert b == 1 and num_ip_adapters == 1
+            b, h, w = mask_tensor.shape
+            assert b == 1
 
             # The IP-Adapters are applied in the cross-attention layers, where the query sequence length is the h * w of
             # the spatial features.
             query_seq_len = h * w
 
-            masks_by_seq_len[query_seq_len] = mask_tensor.view((b, num_ip_adapters, -1, 1))
+            masks_by_seq_len[query_seq_len] = mask_tensor.view((b, -1, 1))
 
             downscale_factor *= 2
             if downscale_factor <= max_downscale_factor:
@@ -185,7 +185,7 @@ class IPAdapterExt(ExtensionBase):
             return
 
         # skip if adapter not marked to work on this attention
-        if not any(target_block in ctx.module_key for target_block in self.target_blocks):
+        if not any(target_block in ctx.processor.attention_key for target_block in self.target_blocks):
             return
 
         weight = self.weight
@@ -196,8 +196,7 @@ class IPAdapterExt(ExtensionBase):
             return
 
         # skip if no weights for this attention
-        ip_attn_weights = self.model.attn_weights._weights.get(str(ctx.module_id), None)
-        if ip_attn_weights is None:
+        if str(ctx.processor.attention_id) not in self.model.attn_weights._weights:
             return
 
         if denoise_ctx.conditioning_mode == ConditioningMode.Both:
@@ -207,10 +206,11 @@ class IPAdapterExt(ExtensionBase):
         else:  # elif denoise_ctx.conditioning_mode == ConditioningMode.Positive:
             embeds = torch.stack([self.positive_embeds])
 
+        ip_attn_weights = self.model.attn_weights._weights[str(ctx.processor.attention_id)]
         ip_key = ip_attn_weights.to_k_ip(embeds)
         ip_value = ip_attn_weights.to_v_ip(embeds)
 
-        ip_hidden_states = ctx.attention_processor.run_attention(
+        ip_hidden_states = ctx.processor.run_attention(
             attn=ctx.attn,
             query=ctx.query,
             key=ip_key,
@@ -218,7 +218,7 @@ class IPAdapterExt(ExtensionBase):
             attention_mask=None,
         )
 
-        mask = self.mask_tensor[ctx.hidden_states.shape[1]].squeeze(0)
+        mask = self.mask_tensor[ctx.hidden_states.shape[1]]
 
         # Expected ip_hidden_states shape: (batch_size, query_seq_len, num_heads * head_dim)
         ctx.hidden_states += weight * ip_hidden_states * mask

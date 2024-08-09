@@ -9,6 +9,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin, SchedulerOutpu
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode, TextConditioningData
+    from invokeai.backend.stable_diffusion.diffusion_backend import StableDiffusionBackend
     from invokeai.backend.stable_diffusion.extensions_manager import ExtensionsManager
 
 
@@ -85,6 +86,9 @@ class DenoiseContext:
 
     # UNet model.
     unet: Optional[UNet2DConditionModel] = None
+
+    # Backend object
+    backend: Optional[StableDiffusionBackend] = None
 
     # Current state of latent-space image in denoising process.
     # None until `PRE_DENOISE_LOOP` callback.

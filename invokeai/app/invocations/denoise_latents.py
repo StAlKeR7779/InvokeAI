@@ -67,7 +67,7 @@ from invokeai.backend.stable_diffusion.extensions.lora import LoRAExt
 from invokeai.backend.stable_diffusion.extensions.multi_diffusion import MultiDiffusionExt
 from invokeai.backend.stable_diffusion.extensions.preview import PreviewExt
 from invokeai.backend.stable_diffusion.extensions.rescale_cfg import RescaleCFGExt
-from invokeai.backend.stable_diffusion.extensions.sag import SAGExt
+from invokeai.backend.stable_diffusion.extensions.seg import SEGExt
 from invokeai.backend.stable_diffusion.extensions.seamless import SeamlessExt
 from invokeai.backend.stable_diffusion.extensions.t2i_adapter import T2IAdapterExt
 from invokeai.backend.stable_diffusion.extensions_manager import ExtensionsManager
@@ -921,7 +921,7 @@ class DenoiseLatentsInvocation(BaseInvocation):
         #    )
         #)
         ext_manager.add_extension(
-            SAGExt(
+            SEGExt(
                 scale=3.0,
                 blur_sigma=9999999.0,
             )
@@ -972,6 +972,7 @@ class DenoiseLatentsInvocation(BaseInvocation):
             ):
                 sd_backend = StableDiffusionBackend()
                 denoise_ctx.unet = unet
+                denoise_ctx.backend = sd_backend
                 result_latents = sd_backend.latents_from_embeddings(denoise_ctx)
 
         # https://discuss.huggingface.co/t/memory-usage-by-later-pipeline-stages/23699

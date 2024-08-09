@@ -19,9 +19,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class AttentionContext:
-    module_id: int
-    module_key: str
-    attention_processor: CustomAttentionProcessor
+    processor: CustomAttentionProcessor
     is_cross_attention: bool
 
     attn: Attention
@@ -53,21 +51,21 @@ class CustomAttnProcessorNew:
     AttnProcessor2_0 (https://github.com/huggingface/diffusers/blob/fcfa270fbd1dc294e2f3a505bae6bcb791d721c3/src/diffusers/models/attention_processor.py#L1204)
     """
 
-    def __init__(self, module_id: Optional[int] = None, module_key: Optional[str] = None):
-        assert (module_id is None) == (module_key is None)
-        self.module_key = module_key
-        self.module_id = module_id
+    def __init__(self, attention_id: Optional[int] = None, attention_key: Optional[str] = None):
+        assert (attention_id is None) == (attention_key is None)
+        self.attention_id = attention_id
+        self.attention_key = attention_key
 
         config = get_config()
-        self.attention_type = config.attention_type
-        if self.attention_type == "auto":
-            self.attention_type = self._select_attention_type()
+        self._attention_type = config.attention_type
+        if self._attention_type == "auto":
+            self._attention_type = self._select_attention_type()
 
-        self.slice_size = config.attention_slice_size
-        if self.slice_size == "auto":
-            self.slice_size = self._select_slice_size()
+        self._slice_size = config.attention_slice_size
+        if self._slice_size == "auto":
+            self._slice_size = self._select_slice_size()
 
-        if self.attention_type == "xformers" and xformers is None:
+        if self._attention_type == "xformers" and xformers is None:
             raise ImportError("xformers attention requires xformers module to be installed.")
 
     def _select_attention_type(self) -> str:
@@ -120,13 +118,10 @@ class CustomAttnProcessorNew:
         **kwargs,
     ) -> torch.Tensor:
         if denoise_ctx is not None:
-            assert self.module_key is not None and self.module_id is not None
+            assert self.attention_key is not None and self.attention_id is not None
 
         ctx = AttentionContext(
-            module_id=self.module_id,
-            module_key=self.module_key,
-            # share only reference to run_attention?
-            attention_processor=self,
+            processor=self,
             is_cross_attention=encoder_hidden_states is not None,
             attn=attn,
             hidden_states=hidden_states,
@@ -201,14 +196,14 @@ class CustomAttnProcessorNew:
         return ctx.hidden_states
 
     def _get_slice_size(self, attn: Attention) -> Optional[int]:
-        if self.slice_size == "none":
+        if self._slice_size == "none":
             return None
-        if isinstance(self.slice_size, int):
-            return self.slice_size
+        if isinstance(self._slice_size, int):
+            return self._slice_size
 
-        if self.slice_size == "max":
+        if self._slice_size == "max":
             return 1
-        if self.slice_size == "balanced":
+        if self._slice_size == "balanced":
             return max(1, attn.sliceable_head_dim // 2)
 
         raise ValueError(f"Incorrect slice_size value: {self.slice_size}")
@@ -223,7 +218,7 @@ class CustomAttnProcessorNew:
     ) -> torch.Tensor:
         slice_size = self._get_slice_size(attn)
         if slice_size is not None:
-            return self.run_attention_sliced(
+            return self._run_attention_sliced(
                 attn=attn,
                 query=query,
                 key=key,
@@ -232,14 +227,14 @@ class CustomAttnProcessorNew:
                 slice_size=slice_size,
             )
 
-        if self.attention_type == "torch-sdp":
-            attn_call = self.run_attention_sdp
-        elif self.attention_type == "normal":
-            attn_call = self.run_attention_normal
-        elif self.attention_type == "xformers":
-            attn_call = self.run_attention_xformers
+        if self._attention_type == "torch-sdp":
+            attn_call = self._run_attention_sdp
+        elif self._attention_type == "normal":
+            attn_call = self._run_attention_normal
+        elif self._attention_type == "xformers":
+            attn_call = self._run_attention_xformers
         else:
-            raise Exception(f"Unknown attention type: {self.attention_type}")
+            raise Exception(f"Unknown attention type: {self._attention_type}")
 
         return attn_call(
             attn=attn,
@@ -249,7 +244,7 @@ class CustomAttnProcessorNew:
             attention_mask=attention_mask,
         )
 
-    def run_attention_normal(
+    def _run_attention_normal(
         self,
         attn: Attention,
         query: torch.Tensor,
@@ -267,7 +262,7 @@ class CustomAttnProcessorNew:
 
         return hidden_states
 
-    def run_attention_xformers(
+    def _run_attention_xformers(
         self,
         attn: Attention,
         query: torch.Tensor,
@@ -296,7 +291,7 @@ class CustomAttnProcessorNew:
 
         return hidden_states
 
-    def run_attention_sdp(
+    def _run_attention_sdp(
         self,
         attn: Attention,
         query: torch.Tensor,
@@ -327,7 +322,7 @@ class CustomAttnProcessorNew:
 
         return hidden_states
 
-    def run_attention_sliced(
+    def _run_attention_sliced(
         self,
         attn: Attention,
         query: torch.Tensor,
@@ -356,18 +351,18 @@ class CustomAttnProcessorNew:
             value_slice = value[start_idx:end_idx]
             attn_mask_slice = attention_mask[start_idx:end_idx] if attention_mask is not None else None
 
-            if self.attention_type == "normal":
+            if self._attention_type == "normal":
                 attn_slice = attn.get_attention_scores(query_slice, key_slice, attn_mask_slice)
                 torch.bmm(attn_slice, value_slice, out=hidden_states[start_idx:end_idx])
                 del attn_slice
-            elif self.attention_type == "xformers":
+            elif self._attention_type == "xformers":
                 if attn_mask_slice is not None:
                     attn_mask_slice = attn_mask_slice.expand(-1, query.shape[1], -1)
 
                 hidden_states[start_idx:end_idx] = xformers.ops.memory_efficient_attention(
                     query_slice, key_slice, value_slice, attn_bias=attn_mask_slice, op=None, scale=attn.scale
                 )
-            elif self.attention_type == "torch-sdp":
+            elif self._attention_type == "torch-sdp":
                 if attn_mask_slice is not None:
                     attn_mask_slice = attn_mask_slice.unsqueeze(0)
 
@@ -381,7 +376,7 @@ class CustomAttnProcessorNew:
                     scale=attn.scale,
                 ).squeeze(0)
             else:
-                raise ValueError(f"Unknown attention type: {self.attention_type}")
+                raise ValueError(f"Unknown attention type: {self._attention_type}")
 
         hidden_states = attn.batch_to_head_dim(hidden_states)
         return hidden_states
