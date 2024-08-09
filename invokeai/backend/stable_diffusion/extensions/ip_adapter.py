@@ -11,12 +11,7 @@ from PIL.Image import Image
 from transformers import CLIPVisionModelWithProjection
 
 from invokeai.backend.ip_adapter.ip_adapter import IPAdapter
-from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode, IPAdapterConditioningInfo
-from invokeai.backend.stable_diffusion.diffusion.custom_atttention import (
-    CustomAttnProcessor2_0,
-    IPAdapterAttentionWeights,
-)
-from invokeai.backend.stable_diffusion.diffusion.regional_ip_data import RegionalIPData
+from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode
 from invokeai.backend.stable_diffusion.extensions.base import ExtensionBase, callback
 from invokeai.backend.util.mask import to_standard_float_mask
 from invokeai.backend.stable_diffusion.extensions_manager import CallbackApi
@@ -55,7 +50,8 @@ class IPAdapterExt(ExtensionBase):
         self.end_step_percent = end_step_percent
 
         self.model: Optional[IPAdapter] = None
-        self.conditioning: Optional[IPAdapterConditioningInfo] = None
+        self.positive_embeds: Optional[torch.Tensor] = None
+        self.negative_embeds: Optional[torch.Tensor] = None
 
     @callback(CallbackApi.setup)
     def preprocess_images(self, ctx: DenoiseContext):
@@ -107,7 +103,8 @@ class IPAdapterExt(ExtensionBase):
                     self.images, image_encoder_model
                 )
 
-        self.conditioning = IPAdapterConditioningInfo(positive_img_prompt_embeds, negative_img_prompt_embeds)
+        self.positive_embeds = positive_img_prompt_embeds
+        self.negative_embeds = negative_img_prompt_embeds
 
         _, _, latent_height, latent_width = ctx.inputs.orig_latents.shape
         tmp = self._preprocess_regional_prompt_mask(
@@ -179,19 +176,15 @@ class IPAdapterExt(ExtensionBase):
 
     @callback(CallbackApi.post_run_attention)
     def post_run_attention(self, ctx: AttentionContext, denoise_ctx: DenoiseContext):
-        # skip if no weights for this attention
-        if str(ctx.module_id) not in self.model.attn_weights._weights:
-            return
-
-        # skip if adapter not marked to work on this attention
-        if not any(target_block in ctx.module_key for target_block in self.target_blocks):
-            return
-
         # skip if model not active in current step
         total_steps = len(denoise_ctx.inputs.timesteps)
         first_step = math.floor(self.begin_step_percent * total_steps)
         last_step = math.ceil(self.end_step_percent * total_steps)
         if denoise_ctx.step_index < first_step or denoise_ctx.step_index > last_step:
+            return
+
+        # skip if adapter not marked to work on this attention
+        if not any(target_block in ctx.module_key for target_block in self.target_blocks):
             return
 
         weight = self.weight
@@ -201,16 +194,18 @@ class IPAdapterExt(ExtensionBase):
         if weight == 0:
             return
 
-        if denoise_ctx.conditioning_mode == ConditioningMode.Both:
-            embeds = torch.stack(
-                [self.conditioning.uncond_image_prompt_embeds, self.conditioning.cond_image_prompt_embeds]
-            )
-        elif denoise_ctx.conditioning_mode == ConditioningMode.Negative:
-            embeds = torch.stack([self.conditioning.uncond_image_prompt_embeds])
-        else:  # elif denoise_ctx.conditioning_mode == ConditioningMode.Positive:
-            embeds = torch.stack([self.conditioning.cond_image_prompt_embeds])
+        # skip if no weights for this attention
+        ip_attn_weights = self.model.attn_weights._weights.get(str(ctx.module_id), None)
+        if ip_attn_weights is None:
+            return
 
-        ip_attn_weights = self.model.attn_weights.get_attention_processor_weights(ctx.module_id)
+        if denoise_ctx.conditioning_mode == ConditioningMode.Both:
+            embeds = torch.stack([self.negative_embeds, self.positive_embeds])
+        elif denoise_ctx.conditioning_mode == ConditioningMode.Negative:
+            embeds = torch.stack([self.negative_embeds])
+        else:  # elif denoise_ctx.conditioning_mode == ConditioningMode.Positive:
+            embeds = torch.stack([self.positive_embeds])
+
         ip_key = ip_attn_weights.to_k_ip(embeds)
         ip_value = ip_attn_weights.to_v_ip(embeds)
 
