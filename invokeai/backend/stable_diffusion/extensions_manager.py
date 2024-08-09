@@ -14,7 +14,42 @@ if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
     from invokeai.backend.stable_diffusion.diffusion.custom_atttention import AttentionContext
     from invokeai.backend.stable_diffusion.extensions.base import CallbackFunctionWithMetadata, ExtensionBase
+    from diffusers.schedulers.scheduling_utils import SchedulerOutput
 
+class OverrideApi:
+    def __init__(self, handler: Callable[..., Any]):
+        self._handler = handler
+
+    def step(
+        self,
+        orig_function: Callable[[DenoiseContext], SchedulerOutput],
+        ctx: DenoiseContext,
+    ) -> SchedulerOutput:
+        pass
+
+    def unet_forward(
+        self,
+        orig_function: Callable[[DenoiseContext], torch.Tensor],
+        ctx: DenoiseContext,
+    ) -> torch.Tensor:
+        pass
+
+    def combine_noise_preds(
+        self,
+        orig_function: Callable[[DenoiseContext], torch.Tensor],
+        ctx: DenoiseContext,
+    ) -> torch.Tensor:
+        pass
+
+    def __getattribute__(self, name: str):
+        if name.startswith("_"):
+            return super().__getattribute__(name)
+
+        func = type(self).__dict__.get(name, None)
+        if func is not None:
+            return partial(self._handler, func.__qualname__)
+
+        raise AttributeError(f"Override \"{name}\" is not defined!")
 
 class CallbackApi:
     def __init__(self, handler: Callable[..., None]):
@@ -72,14 +107,22 @@ class ExtensionsManager:
         self._is_canceled = is_canceled
 
         self.callback = CallbackApi(self._run_callback)
+        self.override = OverrideApi(self._run_override)
 
         # A list of extensions in the order that they were added to the ExtensionsManager.
         self._extensions: List[ExtensionBase] = []
-        self._ordered_callbacks: Dict[ExtensionCallbackType, List[CallbackFunctionWithMetadata]] = {}
+        self._overrides: Dict[str, OverrideFunctionWithMetadata] = {}
+        self._ordered_callbacks: Dict[str, List[CallbackFunctionWithMetadata]] = {}
 
     def add_extension(self, extension: ExtensionBase):
         self._extensions.append(extension)
         self._regenerate_ordered_callbacks()
+        for override_type, override in extension.get_overrides().items():
+            if override_type in self._overrides:
+                raise RuntimeError(
+                    f"Override {override_type} already defined by {self._overrides[override_type].function.__qualname__}"
+                )
+            self._overrides[override_type] = override
 
     def _regenerate_ordered_callbacks(self):
         """Regenerates self._ordered_callbacks. Intended to be called each time a new extension is added."""
@@ -105,6 +148,16 @@ class ExtensionsManager:
         callbacks = self._ordered_callbacks.get(callback_id, [])
         for cb in callbacks:
             cb.function(*args, **kwargs)
+
+    def _run_override(self, override_id: str, orig_function: Callable[..., Any], *args, **kwargs):
+        if self._is_canceled and self._is_canceled():
+            raise CanceledException
+
+        override = self._overrides.get(override_id, None)
+        if override is not None:
+            return override.function(orig_function, *args, **kwargs)
+        else:
+            return orig_function(*args, **kwargs)
 
     @contextmanager
     def patch_extensions(self, ctx: DenoiseContext):

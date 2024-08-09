@@ -69,9 +69,6 @@ class DenoiseInputs:
     # Class of attention processor that is used.
     attention_processor_cls: Type[Any]
 
-    # Extensions manager
-    ext_manager: ExtensionsManager
-
 
 @dataclass
 class DenoiseContext:
@@ -79,6 +76,9 @@ class DenoiseContext:
 
     # Initial variables passed to denoise. Supposed to be unchanged.
     inputs: DenoiseInputs
+
+    # Extensions manager
+    ext_manager: ExtensionsManager
 
     # Scheduler which used to apply noise predictions.
     scheduler: SchedulerMixin

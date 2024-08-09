@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import torch
-from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
-from diffusers.schedulers.scheduling_utils import SchedulerMixin, SchedulerOutput
+from diffusers.schedulers.scheduling_utils import SchedulerOutput
 from tqdm.auto import tqdm
 
 from invokeai.app.services.config.config_default import get_config
@@ -12,17 +11,11 @@ from invokeai.backend.stable_diffusion.extensions_manager import ExtensionsManag
 
 
 class StableDiffusionBackend:
-    def __init__(
-        self,
-        unet: UNet2DConditionModel,
-        scheduler: SchedulerMixin,
-    ):
-        self.unet = unet
-        self.scheduler = scheduler
+    def __init__(self):
         config = get_config()
         self._sequential_guidance = config.sequential_guidance
 
-    def latents_from_embeddings(self, ctx: DenoiseContext, ext_manager: ExtensionsManager):
+    def latents_from_embeddings(self, ctx: DenoiseContext):
         if ctx.inputs.init_timestep.shape[0] == 0:
             return ctx.inputs.orig_latents
 
@@ -30,7 +23,7 @@ class StableDiffusionBackend:
 
         if ctx.inputs.noise is not None:
             batch_size = ctx.latents.shape[0]
-            # latents = noise * self.scheduler.init_noise_sigma # it's like in t2l according to diffusers
+            # latents = noise * ctx.scheduler.init_noise_sigma # it's like in t2l according to diffusers
             ctx.latents = ctx.scheduler.add_noise(
                 ctx.latents, ctx.inputs.noise, ctx.inputs.init_timestep.expand(batch_size)
             )
@@ -41,27 +34,27 @@ class StableDiffusionBackend:
 
         # ext: inpaint[pre_denoise_loop, priority=normal] (maybe init, but not sure if it needed)
         # ext: preview[pre_denoise_loop, priority=low]
-        ext_manager.callback.pre_denoise_loop(ctx)
+        ctx.ext_manager.callback.pre_denoise_loop(ctx)
 
         for ctx.step_index, ctx.timestep in enumerate(tqdm(ctx.inputs.timesteps)):  # noqa: B020
             # ext: inpaint (apply mask to latents on non-inpaint models)
-            ext_manager.callback.pre_step(ctx)
+            ctx.ext_manager.callback.pre_step(ctx)
 
             # ext: tiles? [override: step]
-            ctx.step_output = self.step(ctx, ext_manager)
+            ctx.step_output = ctx.ext_manager.override.step(self.step, ctx)
 
             # ext: inpaint[post_step, priority=high] (apply mask to preview on non-inpaint models)
             # ext: preview[post_step, priority=low]
-            ext_manager.callback.post_step(ctx)
+            ctx.ext_manager.callback.post_step(ctx)
 
             ctx.latents = ctx.step_output.prev_sample
 
         # ext: inpaint[post_denoise_loop] (restore unmasked part)
-        ext_manager.callback.post_denoise_loop(ctx)
+        ctx.ext_manager.callback.post_denoise_loop(ctx)
         return ctx.latents
 
     @torch.inference_mode()
-    def step(self, ctx: DenoiseContext, ext_manager: ExtensionsManager) -> SchedulerOutput:
+    def step(self, ctx: DenoiseContext) -> SchedulerOutput:
         ctx.latent_model_input = ctx.scheduler.scale_model_input(ctx.latents, ctx.timestep)
 
         # TODO: conditionings as list(conditioning_data.to_unet_kwargs - ready)
@@ -69,18 +62,18 @@ class StableDiffusionBackend:
         # This might change in the future as new requirements come up, but for now,
         # this is the rough plan.
         if self._sequential_guidance:
-            ctx.negative_noise_pred = self.run_unet(ctx, ext_manager, ConditioningMode.Negative)
-            ctx.positive_noise_pred = self.run_unet(ctx, ext_manager, ConditioningMode.Positive)
+            ctx.negative_noise_pred = self.run_unet(ctx, ConditioningMode.Negative)
+            ctx.positive_noise_pred = self.run_unet(ctx, ConditioningMode.Positive)
         else:
-            both_noise_pred = self.run_unet(ctx, ext_manager, ConditioningMode.Both)
+            both_noise_pred = self.run_unet(ctx, ConditioningMode.Both)
             ctx.negative_noise_pred, ctx.positive_noise_pred = both_noise_pred.chunk(2)
 
         # ext: override combine_noise_preds
-        ctx.noise_pred = self.combine_noise_preds(ctx)
+        ctx.noise_pred = ctx.ext_manager.override.combine_noise_preds(self.combine_noise_preds, ctx)
 
         # ext: cfg_rescale [modify_noise_prediction]
         # TODO: rename
-        ext_manager.callback.post_combine_noise_preds(ctx)
+        ctx.ext_manager.callback.post_combine_noise_preds(ctx)
 
         # compute the previous noisy sample x_t -> x_t-1
         step_output = ctx.scheduler.step(ctx.noise_pred, ctx.timestep, ctx.latents, **ctx.inputs.scheduler_step_kwargs)
@@ -104,7 +97,7 @@ class StableDiffusionBackend:
         # return torch.lerp(ctx.negative_noise_pred, ctx.positive_noise_pred, guidance_scale)
         return ctx.negative_noise_pred + guidance_scale * (ctx.positive_noise_pred - ctx.negative_noise_pred)
 
-    def run_unet(self, ctx: DenoiseContext, ext_manager: ExtensionsManager, conditioning_mode: ConditioningMode):
+    def run_unet(self, ctx: DenoiseContext, conditioning_mode: ConditioningMode):
         sample = ctx.latent_model_input
         if conditioning_mode == ConditioningMode.Both:
             sample = torch.cat([sample] * 2)
@@ -123,14 +116,14 @@ class StableDiffusionBackend:
         ctx.inputs.conditioning_data.to_unet_kwargs(ctx.unet_kwargs, ctx.conditioning_mode)
 
         # ext: controlnet/ip/t2i [pre_unet]
-        ext_manager.callback.pre_unet_forward(ctx)
+        ctx.ext_manager.callback.pre_unet_forward(ctx)
 
         # ext: inpaint [pre_unet, priority=low]
         # or
         # ext: inpaint [override: unet_forward]
-        noise_pred = self._unet_forward(**vars(ctx.unet_kwargs))
+        noise_pred = ctx.ext_manager.override.unet_forward(self.unet_forward, ctx)
 
-        ext_manager.callback.post_unet_forward(ctx)
+        ctx.ext_manager.callback.post_unet_forward(ctx)
 
         # clean up locals
         ctx.unet_kwargs = None
@@ -138,5 +131,5 @@ class StableDiffusionBackend:
 
         return noise_pred
 
-    def _unet_forward(self, **kwargs) -> torch.Tensor:
-        return self.unet(**kwargs).sample
+    def unet_forward(self, ctx: DenoiseContext) -> torch.Tensor:
+        return ctx.unet(**vars(ctx.unet_kwargs)).sample

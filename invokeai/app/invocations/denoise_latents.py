@@ -925,8 +925,8 @@ class DenoiseLatentsInvocation(BaseInvocation):
                 scheduler_step_kwargs=scheduler_step_kwargs,
                 conditioning_data=conditioning_data,
                 attention_processor_cls=CustomAttnProcessorNew,
-                ext_manager=ext_manager,
             ),
+            ext_manager=ext_manager,
             unet=None,
             scheduler=scheduler,
         )
@@ -954,9 +954,9 @@ class DenoiseLatentsInvocation(BaseInvocation):
                 # ext: freeu, seamless, ip adapter, lora
                 ext_manager.patch_unet(unet, cached_weights),
             ):
-                sd_backend = StableDiffusionBackend(unet, scheduler)
+                sd_backend = StableDiffusionBackend()
                 denoise_ctx.unet = unet
-                result_latents = sd_backend.latents_from_embeddings(denoise_ctx, ext_manager)
+                result_latents = sd_backend.latents_from_embeddings(denoise_ctx)
 
         # https://discuss.huggingface.co/t/memory-usage-by-later-pipeline-stages/23699
         result_latents = result_latents.detach().to("cpu")
