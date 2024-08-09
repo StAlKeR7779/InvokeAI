@@ -16,6 +16,7 @@ from invokeai.backend.stable_diffusion.extensions_manager import CallbackApi
 
 if TYPE_CHECKING:
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
+    from invokeai.backend.stable_diffusion.diffusion.regional_prompt_data import RegionalPromptData
 
 @dataclass
 class AttentionContext:
@@ -114,6 +115,8 @@ class CustomAttnProcessorNew:
         temb: Optional[torch.Tensor] = None,
         # modular backend fields
         denoise_ctx: Optional[DenoiseContext] = None,
+        # For Regional Prompting:
+        regional_prompt_data: Optional[RegionalPromptData] = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -147,6 +150,17 @@ class CustomAttnProcessorNew:
             ctx.hidden_states.shape if ctx.encoder_hidden_states is None else ctx.encoder_hidden_states.shape
         )
         ctx.query_length = ctx.hidden_states.shape[1]
+
+        # TODO: try redo as extension after conditioning rewrite(attention couple)
+        if regional_prompt_data is not None and ctx.is_cross_attention:
+            prompt_region_attention_mask = regional_prompt_data.get_cross_attn_mask(
+                query_seq_len=ctx.query_length, key_seq_len=ctx.key_length
+            )
+
+            if ctx.attention_mask is None:
+                ctx.attention_mask = prompt_region_attention_mask
+            else:
+                ctx.attention_mask += prompt_region_attention_mask
 
         # ext: regional prompts(attention couple)
         if denoise_ctx is not None:
