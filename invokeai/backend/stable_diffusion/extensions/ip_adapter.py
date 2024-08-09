@@ -108,11 +108,11 @@ class IPAdapterExt(ExtensionBase):
         self.negative_embeds = negative_img_prompt_embeds
 
         _, _, latent_height, latent_width = ctx.inputs.orig_latents.shape
-        tmp = self._preprocess_regional_prompt_mask(
+        mask_tensor = self._preprocess_regional_prompt_mask(
             self.mask, latent_height, latent_width, dtype=ctx.inputs.orig_latents.dtype
         )
-        self.mask_tensor = self._prepare_masks(
-            tmp,
+        self.attn_masks = self._prepare_attn_masks(
+            mask_tensor,
             max_downscale_factor=8,
             device=ctx.inputs.orig_latents.device,
             dtype=ctx.inputs.orig_latents.dtype,
@@ -144,7 +144,7 @@ class IPAdapterExt(ExtensionBase):
         resized_mask = tf(mask)
         return resized_mask.squeeze(0)
 
-    def _prepare_masks(
+    def _prepare_attn_masks(
         self, mask_tensor: torch.Tensor, max_downscale_factor: int, device: torch.device, dtype: torch.dtype
     ) -> dict[int, torch.Tensor]:
         mask_tensor = mask_tensor.to(device=device, dtype=dtype, copy=True)
@@ -206,7 +206,7 @@ class IPAdapterExt(ExtensionBase):
         else:  # elif denoise_ctx.conditioning_mode == ConditioningMode.Positive:
             embeds = torch.stack([self.positive_embeds])
 
-        ip_attn_weights = self.model.attn_weights._weights[str(ctx.processor.attention_id)]
+        ip_attn_weights = self.model.attn_weights.get_attention_processor_weights(ctx.processor.attention_id)
         ip_key = ip_attn_weights.to_k_ip(embeds)
         ip_value = ip_attn_weights.to_v_ip(embeds)
 
@@ -218,7 +218,7 @@ class IPAdapterExt(ExtensionBase):
             attention_mask=None,
         )
 
-        mask = self.mask_tensor[ctx.hidden_states.shape[1]]
+        mask = self.attn_masks[ctx.hidden_states.shape[1]]
 
         # Expected ip_hidden_states shape: (batch_size, query_seq_len, num_heads * head_dim)
         ctx.hidden_states += weight * ip_hidden_states * mask

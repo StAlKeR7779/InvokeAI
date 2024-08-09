@@ -58,7 +58,6 @@ class MultiDiffusionExt(ExtensionBase):
         )
         merged_pred_original: torch.Tensor | None = None
         for region_idx, region in enumerate(self.tiles):
-            print(f"{region_idx=} {region=}")
             region_ctx = DenoiseContext(**vars(ctx))
 
             # Crop the inputs to the region.
