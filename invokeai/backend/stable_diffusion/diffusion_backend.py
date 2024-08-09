@@ -86,8 +86,7 @@ class StableDiffusionBackend:
 
         return step_output
 
-    @staticmethod
-    def combine_noise_preds(ctx: DenoiseContext) -> torch.Tensor:
+    def combine_noise_preds(self, ctx: DenoiseContext) -> torch.Tensor:
         guidance_scale = ctx.inputs.conditioning_data.guidance_scale
         if isinstance(guidance_scale, list):
             guidance_scale = guidance_scale[ctx.step_index]

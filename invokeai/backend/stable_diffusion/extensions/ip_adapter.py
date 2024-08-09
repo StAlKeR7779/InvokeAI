@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from invokeai.app.services.shared.invocation_context import InvocationContext
     from invokeai.backend.stable_diffusion.denoise_context import DenoiseContext
     from invokeai.backend.stable_diffusion.extensions_manager import ExtensionsManager
+    from invokeai.backend.stable_diffusion.diffusion.custom_attention_new import AttentionContext
 
 
 class IPAdapterExt(ExtensionBase):

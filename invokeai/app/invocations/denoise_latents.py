@@ -67,6 +67,7 @@ from invokeai.backend.stable_diffusion.extensions.lora import LoRAExt
 from invokeai.backend.stable_diffusion.extensions.multi_diffusion import MultiDiffusionExt
 from invokeai.backend.stable_diffusion.extensions.preview import PreviewExt
 from invokeai.backend.stable_diffusion.extensions.rescale_cfg import RescaleCFGExt
+from invokeai.backend.stable_diffusion.extensions.sag import SAGExt
 from invokeai.backend.stable_diffusion.extensions.seamless import SeamlessExt
 from invokeai.backend.stable_diffusion.extensions.t2i_adapter import T2IAdapterExt
 from invokeai.backend.stable_diffusion.extensions_manager import ExtensionsManager
@@ -912,11 +913,17 @@ class DenoiseLatentsInvocation(BaseInvocation):
         elif mask is not None:
             ext_manager.add_extension(InpaintExt(mask, is_gradient_mask))
 
+        #ext_manager.add_extension(
+        #    MultiDiffusionExt(
+        #        tile_width=1024,
+        #        tile_height=1024,
+        #        tile_overlap=32,
+        #    )
+        #)
         ext_manager.add_extension(
-            MultiDiffusionExt(
-                tile_width=1024,
-                tile_height=1024,
-                tile_overlap=32,
+            SAGExt(
+                scale=3.0,
+                blur_sigma=9999999.0,
             )
         )
 
