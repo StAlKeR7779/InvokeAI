@@ -18,54 +18,9 @@ from invokeai.backend.rectified_flow.rectified_flow_inpaint_extension import Rec
 from invokeai.backend.stable_diffusion.diffusers_pipeline import PipelineIntermediateState
 from invokeai.backend.util.devices import TorchDevice
 
-
-@dataclass
-class DenoiseContext:
-    """Context with all variables in denoise"""
-
-    model: Flux
-
-    # model input
-    img: torch.Tensor
-    img_ids: torch.Tensor
-    pos_regional_prompting_extension: RegionalPromptingExtension
-    neg_regional_prompting_extension: RegionalPromptingExtension | None
-
-    # sampling parameters
-    timesteps: list[float]
-    scheduler: SchedulerMixin
-    step_callback: Callable[[PipelineIntermediateState], None]
-    guidance: float
-    cfg_scale: list[float]
-    inpaint_extension: RectifiedFlowInpaintExtension | None
-    controlnet_extensions: list[XLabsControlNetExtension | InstantXControlNetExtension]
-    pos_ip_adapter_extensions: list[XLabsIPAdapterExtension]
-    neg_ip_adapter_extensions: list[XLabsIPAdapterExtension]
-
-    # extra img tokens (channel-wise)
-    img_cond: torch.Tensor | None
-
-    # extra img tokens (sequence-wise) - for Kontext conditioning
-    img_cond_seq: torch.Tensor | None = None
-    img_cond_seq_ids: torch.Tensor | None = None
-
-    # DyPE extension for high-resolution generation
-    dype_extension: DyPEExtension | None = None
-
-    # local vars
-    step_index: int | None = None
-    user_step: int | None = None
-    total_steps: int | None = None
-    t_vec: torch.Tensor | None = None
-    guidance_vec: torch.Tensor | None = None
-
-
-# TODO: use global type
-from enum import Enum
-class ConditioningMode(Enum):
-    Both = "both"
-    Negative = "negative"
-    Positive = "positive"
+from invokeai.backend.flux.denoise_context import DenoiseContext
+# TODO: move outside sd
+from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode
 
 
 def denoise(
