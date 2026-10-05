@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
-
-import torch
+from typing import TYPE_CHECKING, Callable
 
 from invokeai.backend.stable_diffusion.diffusers_pipeline import PipelineIntermediateState
 
@@ -42,7 +39,7 @@ class PreviewExt:
             self.callback(
                 PipelineIntermediateState(
                     step=ctx.user_step,
-                    order=ctx.scheduler.order, # PATCH: use order defined in scheduler class
+                    order=ctx.scheduler.order,  # PATCH: use order defined in scheduler class
                     total_steps=ctx.total_steps,
                     timestep=int(ctx.timestep),  # TODO: not used anywhere in code
                     latents=predicted_original,

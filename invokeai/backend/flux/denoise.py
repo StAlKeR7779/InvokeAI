@@ -1,28 +1,27 @@
+import contextlib
 import inspect
 import math
-import contextlib
 from typing import Callable
-from dataclasses import dataclass, field
 
 import torch
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from tqdm import tqdm
 
 from invokeai.backend.flux.controlnet.controlnet_flux_output import ControlNetFluxOutput, sum_controlnet_flux_outputs
+from invokeai.backend.flux.denoise_context import DenoiseContext
 from invokeai.backend.flux.extensions.dype_extension import DyPEExtension
 from invokeai.backend.flux.extensions.instantx_controlnet_extension import InstantXControlNetExtension
+from invokeai.backend.flux.extensions.preview import PreviewExt
 from invokeai.backend.flux.extensions.regional_prompting_extension import RegionalPromptingExtension
 from invokeai.backend.flux.extensions.xlabs_controlnet_extension import XLabsControlNetExtension
 from invokeai.backend.flux.extensions.xlabs_ip_adapter_extension import XLabsIPAdapterExtension
-from invokeai.backend.flux.extensions.preview import PreviewExt
 from invokeai.backend.flux.model import Flux
 from invokeai.backend.rectified_flow.rectified_flow_inpaint_extension import RectifiedFlowInpaintExtension
 from invokeai.backend.stable_diffusion.diffusers_pipeline import PipelineIntermediateState
-from invokeai.backend.util.devices import TorchDevice
 
-from invokeai.backend.flux.denoise_context import DenoiseContext
 # TODO: move outside sd
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode
+from invokeai.backend.util.devices import TorchDevice
 
 
 def denoise(
@@ -74,7 +73,6 @@ def denoise(
         img_cond_seq_ids=img_cond_seq_ids,
         # DyPE extension for high-resolution generation
         dype_extension=dype_extension,
-
         preview_ext=PreviewExt(step_callback),
     )
     with contextlib.ExitStack() as exit_stack:
@@ -122,7 +120,7 @@ def denoise_(
     # Use tqdm with total_steps (user-facing steps) not num_scheduler_steps (internal steps)
     # This ensures progress bar shows 1/8, 2/8, etc. even when scheduler uses more internal steps
     pbar = tqdm(total=ctx.total_steps, desc=f"Denoising{TorchDevice.get_session_device_label()}")
-    for ctx.step_index, ctx.timestep in enumerate(ctx.scheduler.timesteps):
+    for ctx.step_index, ctx.timestep in enumerate(ctx.scheduler.timesteps):  # noqa: B020
         # PATCH: detect internal steps in a more generic way
         if ctx.scheduler.order == 1:
             ctx.is_scheduler_internal_step = False
@@ -160,8 +158,12 @@ def denoise_(
 
         # POST_SAMPLER_STEP -  RectifiedFlowInpaintExtension, PreviewExt(order=last)
         if ctx.inpaint_extension is not None:
-            ctx.step_output.prev_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(ctx.step_output.prev_sample, sigma_prev)
-            ctx.step_output.pred_original_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(ctx.step_output.pred_original_sample, 0.0)
+            ctx.step_output.prev_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(
+                ctx.step_output.prev_sample, sigma_prev
+            )
+            ctx.step_output.pred_original_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(
+                ctx.step_output.pred_original_sample, 0.0
+            )
 
         if ctx.preview_ext is not None:
             ctx.preview_ext.step_preview(ctx)
@@ -208,7 +210,7 @@ def run_controlnets(ctx: DenoiseContext):
     batch_size = ctx.img.shape[0]
     timesteps = torch.full((batch_size,), ctx.timestep / 1000, dtype=ctx.img.dtype, device=ctx.img.device)
     guidance_vec = torch.full((batch_size,), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
-    
+
     controlnet_residuals: list[ControlNetFluxOutput] = []
     for controlnet_extension in ctx.controlnet_extensions:
         controlnet_residuals.append(
@@ -269,14 +271,14 @@ def run_model(ctx: DenoiseContext, conditioning_mode: ConditioningMode):
 
     controlnet_double_block_residuals = None
     controlnet_single_block_residuals = None
-    if (merged_controlnet_residuals != None):
+    if merged_controlnet_residuals is not None:
         controlnet_double_block_residuals = merged_controlnet_residuals.double_block_residuals
         controlnet_single_block_residuals = merged_controlnet_residuals.single_block_residuals
 
     batch_size = ctx.img.shape[0]
     timesteps = torch.full((batch_size,), ctx.timestep / 1000, dtype=ctx.img.dtype, device=ctx.img.device)
     guidance_vec = torch.full((batch_size,), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
-    
+
     pred = ctx.model(
         img=img_input,
         img_ids=img_input_ids,

@@ -1,9 +1,9 @@
 """DyPE extension for FLUX denoising pipeline."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -11,8 +11,8 @@ from invokeai.backend.flux.dype.base import DyPEConfig
 from invokeai.backend.flux.dype.embed import DyPEEmbedND
 
 if TYPE_CHECKING:
-    from invokeai.backend.flux.model import Flux
     from invokeai.backend.flux.denoise_context import DenoiseContext
+    from invokeai.backend.flux.model import Flux
 
 
 class DyPEExtension:
@@ -61,8 +61,6 @@ class DyPEExtension:
 
             # Replace the embedder
             model.pe_embedder = self.embedder
-
-            #return dype_embedder, original_embedder
             yield
         finally:
             self.embedder = None

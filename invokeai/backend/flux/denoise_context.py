@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from diffusers.schedulers.scheduling_utils import SchedulerMixin, SchedulerOutput
 
 if TYPE_CHECKING:
-    from invokeai.backend.flux.model import Flux
+    from invokeai.backend.flux.extensions.dype_extension import DyPEExtension
+    from invokeai.backend.flux.extensions.instantx_controlnet_extension import InstantXControlNetExtension
+    from invokeai.backend.flux.extensions.preview import PreviewExt
     from invokeai.backend.flux.extensions.regional_prompting_extension import RegionalPromptingExtension
     from invokeai.backend.flux.extensions.xlabs_controlnet_extension import XLabsControlNetExtension
-    from invokeai.backend.flux.extensions.instantx_controlnet_extension import InstantXControlNetExtension
     from invokeai.backend.flux.extensions.xlabs_ip_adapter_extension import XLabsIPAdapterExtension
-    from invokeai.backend.flux.extensions.dype_extension import DyPEExtension
+    from invokeai.backend.flux.model import Flux
     from invokeai.backend.rectified_flow.rectified_flow_inpaint_extension import RectifiedFlowInpaintExtension
-    from invokeai.backend.stable_diffusion.diffusers_pipeline import PipelineIntermediateState
-    from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode, TextConditioningData
-    from invokeai.backend.flux.extensions.preview import PreviewExt
+    from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode
 
 
 # @dataclass
