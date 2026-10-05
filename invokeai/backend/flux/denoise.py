@@ -135,18 +135,24 @@ def denoise_(
         else:
             pred = guidance_cfg(ctx, step_cfg_scale)
 
+        # Get sigma_prev for inpainting (next sigma value)
+        if ctx.step_index + 1 < len(ctx.scheduler.sigmas):
+            sigma_prev = ctx.scheduler.sigmas[ctx.step_index + 1].item()
+        else:
+            sigma_prev = 0.0
+
         # Use scheduler.step() for the update
         step_output = ctx.scheduler.step(model_output=pred, timestep=timestep, sample=ctx.img)
-        ctx.img = step_output.prev_sample
+        if not hasattr(step_output, "pred_original_sample"):
+            # FIX: use sigma_prev instead of t_cur to generate preview image
+            # we should use sigma(noise/signal ratio) instead of timestep
+            # prev_sample already next step latents, so we should use next step sigma value
+            step_output.pred_original_sample = step_output.prev_sample - sigma_prev * pred
 
         # POST_SAMPLER_STEP -  RectifiedFlowInpaintExtension, PreviewExt(order=last)
         if ctx.inpaint_extension is not None:
-            # Get sigma_prev for inpainting (next sigma value)
-            if ctx.step_index + 1 < len(ctx.scheduler.sigmas):
-                sigma_prev = ctx.scheduler.sigmas[ctx.step_index + 1].item()
-            else:
-                sigma_prev = 0.0
-            ctx.img = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(ctx.img, sigma_prev)
+            step_output.prev_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(step_output.prev_sample, sigma_prev)
+            step_output.pred_original_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(step_output.pred_original_sample, 0.0)
 
         # For Heun, only increment user step after second-order step completes
         is_heun = hasattr(ctx.scheduler, "state_in_first_order")
@@ -157,20 +163,17 @@ def denoise_(
             # (LCM scheduler may have more internal steps than user-facing steps)
             if ctx.user_step <= ctx.total_steps:
                 pbar.update(1)
-                preview_img = ctx.img - ctx.t_curr * pred
-                if ctx.inpaint_extension is not None:
-                    preview_img = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(
-                        preview_img, 0.0
-                    )
                 ctx.step_callback(
                     PipelineIntermediateState(
                         step=ctx.user_step,
                         order=2 if is_heun else 1,
                         total_steps=ctx.total_steps,
                         timestep=int(ctx.t_curr * 1000),  # TODO: not used anywhere in code
-                        latents=preview_img,
+                        latents=step_output.pred_original_sample,
                     ),
                 )
+
+        ctx.img = step_output.prev_sample
 
     pbar.close()
     return ctx.img
