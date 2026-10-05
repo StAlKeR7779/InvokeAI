@@ -44,7 +44,7 @@ class PreviewExt:
                     step=ctx.user_step,
                     order=ctx.scheduler.order, # PATCH: use order defined in scheduler class
                     total_steps=ctx.total_steps,
-                    timestep=int(ctx.t_curr * 1000),  # TODO: not used anywhere in code
+                    timestep=int(ctx.timestep),  # TODO: not used anywhere in code
                     latents=predicted_original,
                 ),
             )

@@ -109,9 +109,6 @@ def denoise_(
         num_inference_steps = len(ctx.timesteps) - 1
         ctx.scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=ctx.img.device)
 
-    # For schedulers like Heun, the number of actual steps may differ
-    # (Heun doubles timesteps internally)
-    num_scheduler_steps = len(ctx.scheduler.timesteps)
     # For user-facing step count, use the original number of denoising steps
     ctx.total_steps = len(ctx.timesteps) - 1
 
@@ -125,11 +122,7 @@ def denoise_(
     # Use tqdm with total_steps (user-facing steps) not num_scheduler_steps (internal steps)
     # This ensures progress bar shows 1/8, 2/8, etc. even when scheduler uses more internal steps
     pbar = tqdm(total=ctx.total_steps, desc=f"Denoising{TorchDevice.get_session_device_label()}")
-    for ctx.step_index in range(num_scheduler_steps):
-        timestep = ctx.scheduler.timesteps[ctx.step_index]
-        # Convert scheduler timestep (0-1000) to normalized (0-1) for the model
-        ctx.t_curr = timestep.item() / ctx.scheduler.config.num_train_timesteps
-
+    for ctx.step_index, ctx.timestep in enumerate(ctx.scheduler.timesteps):
         # PATCH: detect internal steps in a more generic way
         if ctx.scheduler.order == 1:
             ctx.is_scheduler_internal_step = False
@@ -150,14 +143,14 @@ def denoise_(
         else:
             pred = guidance_cfg(ctx, step_cfg_scale)
 
-        # Get sigma_prev for inpainting (next sigma value)
+        # Get sigma_prev for inpainting (next step sigma value)
         if ctx.step_index + 1 < len(ctx.scheduler.sigmas):
             sigma_prev = ctx.scheduler.sigmas[ctx.step_index + 1].item()
         else:
             sigma_prev = 0.0
 
         # Use scheduler.step() for the update
-        ctx.step_output = ctx.scheduler.step(model_output=pred, timestep=timestep, sample=ctx.img)
+        ctx.step_output = ctx.scheduler.step(model_output=pred, timestep=ctx.timestep, sample=ctx.img)
         if not hasattr(ctx.step_output, "pred_original_sample"):
             # PATCH: always generate predicted output, same as non flow-match schedulers
             # FIX: use sigma_prev instead of t_cur to generate preview image
@@ -212,8 +205,10 @@ def run_controlnets(ctx: DenoiseContext):
         return None
 
     # Run ControlNet models.
-    t_vec = torch.full((ctx.img.shape[0],), ctx.t_curr, dtype=ctx.img.dtype, device=ctx.img.device)
-    guidance_vec = torch.full((ctx.img.shape[0],), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
+    batch_size = ctx.img.shape[0]
+    timesteps = torch.full((batch_size,), ctx.timestep / 1000, dtype=ctx.img.dtype, device=ctx.img.device)
+    guidance_vec = torch.full((batch_size,), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
+    
     controlnet_residuals: list[ControlNetFluxOutput] = []
     for controlnet_extension in ctx.controlnet_extensions:
         controlnet_residuals.append(
@@ -225,7 +220,7 @@ def run_controlnets(ctx: DenoiseContext):
                 txt=regional_prompting_extension.regional_text_conditioning.t5_embeddings,
                 txt_ids=regional_prompting_extension.regional_text_conditioning.t5_txt_ids,
                 y=regional_prompting_extension.regional_text_conditioning.clip_embeddings,
-                timesteps=t_vec,
+                timesteps=timesteps,
                 guidance=guidance_vec,
             )
         )
@@ -278,15 +273,17 @@ def run_model(ctx: DenoiseContext, conditioning_mode: ConditioningMode):
         controlnet_double_block_residuals = merged_controlnet_residuals.double_block_residuals
         controlnet_single_block_residuals = merged_controlnet_residuals.single_block_residuals
 
-    t_vec = torch.full((ctx.img.shape[0],), ctx.t_curr, dtype=ctx.img.dtype, device=ctx.img.device)
-    guidance_vec = torch.full((ctx.img.shape[0],), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
+    batch_size = ctx.img.shape[0]
+    timesteps = torch.full((batch_size,), ctx.timestep / 1000, dtype=ctx.img.dtype, device=ctx.img.device)
+    guidance_vec = torch.full((batch_size,), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
+    
     pred = ctx.model(
         img=img_input,
         img_ids=img_input_ids,
         txt=regional_prompting_extension.regional_text_conditioning.t5_embeddings,
         txt_ids=regional_prompting_extension.regional_text_conditioning.t5_txt_ids,
         y=regional_prompting_extension.regional_text_conditioning.clip_embeddings,
-        timesteps=t_vec,
+        timesteps=timesteps,
         guidance=guidance_vec,
         timestep_index=ctx.user_step,  # TODO:
         total_num_timesteps=ctx.total_steps,

@@ -80,7 +80,7 @@ class DyPEExtension:
         """
 
         cur_sigma = self.resolve_step_sigma(
-            fallback_sigma=ctx.t_curr,
+            fallback_sigma=ctx.timestep.item() / 1000,
             step_index=ctx.step_index,
             scheduler_sigmas=getattr(ctx.scheduler, "sigmas", None),
         )

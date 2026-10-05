@@ -74,7 +74,7 @@ class DenoiseContext:
     user_step: int | None = None
     total_steps: int | None = None
     is_scheduler_internal_step: bool | None = None
-    t_curr: float | None = None
+    timestep: Optional[torch.Tensor] = None
     conditioning_mode: ConditioningMode | None = None
     step_output: SchedulerOutput | None = None
 
