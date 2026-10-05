@@ -1,7 +1,9 @@
 """DyPE extension for FLUX denoising pipeline."""
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
+from contextlib import contextmanager
 
 import torch
 
@@ -10,9 +12,9 @@ from invokeai.backend.flux.dype.embed import DyPEEmbedND
 
 if TYPE_CHECKING:
     from invokeai.backend.flux.model import Flux
+    from invokeai.backend.flux.denoise_context import DenoiseContext
 
 
-@dataclass
 class DyPEExtension:
     """Extension for Dynamic Position Extrapolation in FLUX models.
 
@@ -26,11 +28,14 @@ class DyPEExtension:
         4. Call restore_model() after denoising to restore original embedder
     """
 
-    config: DyPEConfig
-    target_height: int
-    target_width: int
+    def __init__(self, config: DyPEConfig, target_height: int, target_width: int):
+        self.config = config
+        self.target_height = target_height
+        self.target_width = target_width
+        self.embedder = None
 
-    def patch_model(self, model: "Flux") -> tuple[DyPEEmbedND, object]:
+    @contextmanager
+    def patch_model(self, ctx: DenoiseContext, model: Flux):
         """Patch the model's position embedder with DyPE version.
 
         Args:
@@ -41,28 +46,29 @@ class DyPEExtension:
         """
         original_embedder = model.pe_embedder
 
-        dype_embedder = DyPEEmbedND.from_embednd(
-            embed_nd=original_embedder,
-            dype_config=self.config,
-        )
+        try:
+            self.embedder = DyPEEmbedND.from_embednd(
+                embed_nd=original_embedder,
+                dype_config=self.config,
+            )
 
-        # Set initial state
-        dype_embedder.set_step_state(
-            sigma=1.0,
-            height=self.target_height,
-            width=self.target_width,
-        )
+            # Set initial state
+            self.embedder.set_step_state(
+                sigma=1.0,
+                height=self.target_height,
+                width=self.target_width,
+            )
 
-        # Replace the embedder
-        model.pe_embedder = dype_embedder
+            # Replace the embedder
+            model.pe_embedder = self.embedder
 
-        return dype_embedder, original_embedder
+            #return dype_embedder, original_embedder
+            yield
+        finally:
+            self.embedder = None
+            model.pe_embedder = original_embedder
 
-    def update_step_state(
-        self,
-        embedder: DyPEEmbedND,
-        sigma: float,
-    ) -> None:
+    def update_step_state(self, ctx: DenoiseContext) -> None:
         """Update the step state in the DyPE embedder.
 
         This should be called before each denoising step to update the
@@ -72,8 +78,15 @@ class DyPEExtension:
             embedder: The DyPE embedder to update
             sigma: Current noise level for the active denoising step
         """
-        embedder.set_step_state(
-            sigma=sigma,
+
+        cur_sigma = self.resolve_step_sigma(
+            fallback_sigma=ctx.t_curr,
+            step_index=ctx.step_index,
+            scheduler_sigmas=getattr(ctx.scheduler, "sigmas", None),
+        )
+
+        self.embedder.set_step_state(
+            sigma=cur_sigma,
             height=self.target_height,
             width=self.target_width,
         )
@@ -101,13 +114,3 @@ class DyPEExtension:
         if isinstance(sigma, torch.Tensor):
             return float(sigma.item())
         return float(sigma)
-
-    @staticmethod
-    def restore_model(model: "Flux", original_embedder: object) -> None:
-        """Restore the original position embedder.
-
-        Args:
-            model: The FLUX model to restore
-            original_embedder: The original embedder saved from patch_model()
-        """
-        model.pe_embedder = original_embedder

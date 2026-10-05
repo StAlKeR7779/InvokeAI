@@ -1,5 +1,6 @@
 import inspect
 import math
+import contextlib
 from typing import Callable
 from dataclasses import dataclass, field
 
@@ -74,9 +75,12 @@ def denoise(
         # DyPE extension for high-resolution generation
         dype_extension=dype_extension,
     )
-    return denoise_(
-        ctx=ctx,
-    )
+    with contextlib.ExitStack() as exit_stack:
+        if dype_extension is not None:
+            exit_stack.enter_context(dype_extension.patch_model(ctx, ctx.model))
+        return denoise_(
+            ctx=ctx,
+        )
 
 
 def denoise_(
@@ -109,88 +113,67 @@ def denoise_(
     # For user-facing step count, use the original number of denoising steps
     ctx.total_steps = len(ctx.timesteps) - 1
 
-    # DyPE: Patch model with DyPE-aware position embedder
-    dype_embedder = None
-    original_pe_embedder = None
-    if ctx.dype_extension is not None:
-        dype_embedder, original_pe_embedder = ctx.dype_extension.patch_model(ctx.model)
+    # Track the actual step for user-facing progress (accounts for Heun's double steps)
+    ctx.user_step = 0
 
-    try:
-        # Track the actual step for user-facing progress (accounts for Heun's double steps)
-        ctx.user_step = 0
+    # Use tqdm with total_steps (user-facing steps) not num_scheduler_steps (internal steps)
+    # This ensures progress bar shows 1/8, 2/8, etc. even when scheduler uses more internal steps
+    pbar = tqdm(total=ctx.total_steps, desc=f"Denoising{TorchDevice.get_session_device_label()}")
+    for ctx.step_index in range(num_scheduler_steps):
+        timestep = ctx.scheduler.timesteps[ctx.step_index]
+        # Convert scheduler timestep (0-1000) to normalized (0-1) for the model
+        ctx.t_curr = timestep.item() / ctx.scheduler.config.num_train_timesteps
 
-        # Use tqdm with total_steps (user-facing steps) not num_scheduler_steps (internal steps)
-        # This ensures progress bar shows 1/8, 2/8, etc. even when scheduler uses more internal steps
-        pbar = tqdm(total=ctx.total_steps, desc=f"Denoising{TorchDevice.get_session_device_label()}")
-        for ctx.step_index in range(num_scheduler_steps):
-            timestep = ctx.scheduler.timesteps[ctx.step_index]
-            # Convert scheduler timestep (0-1000) to normalized (0-1) for the model
-            ctx.t_curr = timestep.item() / ctx.scheduler.config.num_train_timesteps
+        # PRE_SAMPLER_STEP - DyPEExtension
+        # DyPE: Update step state for timestep-dependent scaling
+        if ctx.dype_extension is not None:
+            ctx.dype_extension.update_step_state(ctx)
 
-            # PRE_SAMPLER_STEP - DyPEExtension
-            # DyPE: Update step state for timestep-dependent scaling
-            if ctx.dype_extension is not None and dype_embedder is not None:
-                dype_sigma = DyPEExtension.resolve_step_sigma(
-                    fallback_sigma=ctx.t_curr,
-                    step_index=ctx.step_index,
-                    scheduler_sigmas=getattr(ctx.scheduler, "sigmas", None),
-                )
+        step_cfg_scale = ctx.cfg_scale[min(ctx.user_step, len(ctx.cfg_scale) - 1)]
+        if math.isclose(step_cfg_scale, 1.0):
+            pred = guidance_none(ctx)
+        else:
+            pred = guidance_cfg(ctx, step_cfg_scale)
 
-                ctx.dype_extension.update_step_state(
-                    embedder=dype_embedder,
-                    sigma=dype_sigma,
-                )
+        # Use scheduler.step() for the update
+        step_output = ctx.scheduler.step(model_output=pred, timestep=timestep, sample=ctx.img)
+        ctx.img = step_output.prev_sample
 
-            step_cfg_scale = ctx.cfg_scale[min(ctx.user_step, len(ctx.cfg_scale) - 1)]
-            if math.isclose(step_cfg_scale, 1.0):
-                pred = guidance_none(ctx)
+        # POST_SAMPLER_STEP -  RectifiedFlowInpaintExtension, PreviewExt(order=last)
+        if ctx.inpaint_extension is not None:
+            # Get sigma_prev for inpainting (next sigma value)
+            if ctx.step_index + 1 < len(ctx.scheduler.sigmas):
+                sigma_prev = ctx.scheduler.sigmas[ctx.step_index + 1].item()
             else:
-                pred = guidance_cfg(ctx, step_cfg_scale)
+                sigma_prev = 0.0
+            ctx.img = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(ctx.img, sigma_prev)
 
-            # Use scheduler.step() for the update
-            step_output = ctx.scheduler.step(model_output=pred, timestep=timestep, sample=ctx.img)
-            ctx.img = step_output.prev_sample
-
-            # POST_SAMPLER_STEP -  RectifiedFlowInpaintExtension, PreviewExt(order=last)
-            if ctx.inpaint_extension is not None:
-                # Get sigma_prev for inpainting (next sigma value)
-                if ctx.step_index + 1 < len(ctx.scheduler.sigmas):
-                    sigma_prev = ctx.scheduler.sigmas[ctx.step_index + 1].item()
-                else:
-                    sigma_prev = 0.0
-                ctx.img = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(ctx.img, sigma_prev)
-
-            # For Heun, only increment user step after second-order step completes
-            is_heun = hasattr(ctx.scheduler, "state_in_first_order")
-            in_first_order = ctx.scheduler.state_in_first_order if is_heun else True
-            if (is_heun and not in_first_order) or (not is_heun):
-                ctx.user_step += 1
-                # Only call step_callback if we haven't exceeded total_steps
-                # (LCM scheduler may have more internal steps than user-facing steps)
-                if ctx.user_step <= ctx.total_steps:
-                    pbar.update(1)
-                    preview_img = ctx.img - ctx.t_curr * pred
-                    if ctx.inpaint_extension is not None:
-                        preview_img = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(
-                            preview_img, 0.0
-                        )
-                    ctx.step_callback(
-                        PipelineIntermediateState(
-                            step=ctx.user_step,
-                            order=2 if is_heun else 1,
-                            total_steps=ctx.total_steps,
-                            timestep=int(ctx.t_curr * 1000),  # TODO: not used anywhere in code
-                            latents=preview_img,
-                        ),
+        # For Heun, only increment user step after second-order step completes
+        is_heun = hasattr(ctx.scheduler, "state_in_first_order")
+        in_first_order = ctx.scheduler.state_in_first_order if is_heun else True
+        if (is_heun and not in_first_order) or (not is_heun):
+            ctx.user_step += 1
+            # Only call step_callback if we haven't exceeded total_steps
+            # (LCM scheduler may have more internal steps than user-facing steps)
+            if ctx.user_step <= ctx.total_steps:
+                pbar.update(1)
+                preview_img = ctx.img - ctx.t_curr * pred
+                if ctx.inpaint_extension is not None:
+                    preview_img = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(
+                        preview_img, 0.0
                     )
+                ctx.step_callback(
+                    PipelineIntermediateState(
+                        step=ctx.user_step,
+                        order=2 if is_heun else 1,
+                        total_steps=ctx.total_steps,
+                        timestep=int(ctx.t_curr * 1000),  # TODO: not used anywhere in code
+                        latents=preview_img,
+                    ),
+                )
 
-        pbar.close()
-        return ctx.img
-
-    finally:
-        # DyPE: Restore original position embedder
-        if original_pe_embedder is not None:
-            DyPEExtension.restore_model(ctx.model, original_pe_embedder)
+    pbar.close()
+    return ctx.img
 
 
 def guidance_none(ctx: DenoiseContext) -> torch.Tensor:
