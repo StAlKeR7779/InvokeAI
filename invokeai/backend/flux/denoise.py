@@ -14,6 +14,7 @@ from invokeai.backend.flux.extensions.instantx_controlnet_extension import Insta
 from invokeai.backend.flux.extensions.regional_prompting_extension import RegionalPromptingExtension
 from invokeai.backend.flux.extensions.xlabs_controlnet_extension import XLabsControlNetExtension
 from invokeai.backend.flux.extensions.xlabs_ip_adapter_extension import XLabsIPAdapterExtension
+from invokeai.backend.flux.extensions.preview import PreviewExt
 from invokeai.backend.flux.model import Flux
 from invokeai.backend.rectified_flow.rectified_flow_inpaint_extension import RectifiedFlowInpaintExtension
 from invokeai.backend.stable_diffusion.diffusers_pipeline import PipelineIntermediateState
@@ -60,7 +61,6 @@ def denoise(
         # sampling parameters
         timesteps=timesteps,
         scheduler=scheduler,
-        step_callback=step_callback,
         guidance=guidance,
         cfg_scale=cfg_scale,
         inpaint_extension=inpaint_extension,
@@ -74,6 +74,8 @@ def denoise(
         img_cond_seq_ids=img_cond_seq_ids,
         # DyPE extension for high-resolution generation
         dype_extension=dype_extension,
+
+        preview_ext=PreviewExt(step_callback),
     )
     with contextlib.ExitStack() as exit_stack:
         if dype_extension is not None:
@@ -116,6 +118,10 @@ def denoise_(
     # Track the actual step for user-facing progress (accounts for Heun's double steps)
     ctx.user_step = 0
 
+    # PATCH: output initial latents to not have empty screen during first step generation
+    if ctx.preview_ext is not None:
+        ctx.preview_ext.initial_preview(ctx)
+
     # Use tqdm with total_steps (user-facing steps) not num_scheduler_steps (internal steps)
     # This ensures progress bar shows 1/8, 2/8, etc. even when scheduler uses more internal steps
     pbar = tqdm(total=ctx.total_steps, desc=f"Denoising{TorchDevice.get_session_device_label()}")
@@ -123,6 +129,15 @@ def denoise_(
         timestep = ctx.scheduler.timesteps[ctx.step_index]
         # Convert scheduler timestep (0-1000) to normalized (0-1) for the model
         ctx.t_curr = timestep.item() / ctx.scheduler.config.num_train_timesteps
+
+        # PATCH: detect internal steps in a more generic way
+        if ctx.scheduler.order == 1:
+            ctx.is_scheduler_internal_step = False
+        elif ctx.scheduler.order == 2:
+            assert hasattr(ctx.scheduler, "state_in_first_order")
+            ctx.is_scheduler_internal_step = not ctx.scheduler.state_in_first_order
+        else:
+            raise Exception("Support for scheduler with order higher than 2 not implemented!")
 
         # PRE_SAMPLER_STEP - DyPEExtension
         # DyPE: Update step state for timestep-dependent scaling
@@ -142,38 +157,29 @@ def denoise_(
             sigma_prev = 0.0
 
         # Use scheduler.step() for the update
-        step_output = ctx.scheduler.step(model_output=pred, timestep=timestep, sample=ctx.img)
-        if not hasattr(step_output, "pred_original_sample"):
+        ctx.step_output = ctx.scheduler.step(model_output=pred, timestep=timestep, sample=ctx.img)
+        if not hasattr(ctx.step_output, "pred_original_sample"):
+            # PATCH: always generate predicted output, same as non flow-match schedulers
             # FIX: use sigma_prev instead of t_cur to generate preview image
             # we should use sigma(noise/signal ratio) instead of timestep
             # prev_sample already next step latents, so we should use next step sigma value
-            step_output.pred_original_sample = step_output.prev_sample - sigma_prev * pred
+            ctx.step_output.pred_original_sample = ctx.step_output.prev_sample - sigma_prev * pred
 
         # POST_SAMPLER_STEP -  RectifiedFlowInpaintExtension, PreviewExt(order=last)
         if ctx.inpaint_extension is not None:
-            step_output.prev_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(step_output.prev_sample, sigma_prev)
-            step_output.pred_original_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(step_output.pred_original_sample, 0.0)
+            ctx.step_output.prev_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(ctx.step_output.prev_sample, sigma_prev)
+            ctx.step_output.pred_original_sample = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(ctx.step_output.pred_original_sample, 0.0)
 
-        # For Heun, only increment user step after second-order step completes
-        is_heun = hasattr(ctx.scheduler, "state_in_first_order")
-        in_first_order = ctx.scheduler.state_in_first_order if is_heun else True
-        if (is_heun and not in_first_order) or (not is_heun):
+        if ctx.preview_ext is not None:
+            ctx.preview_ext.step_preview(ctx)
+
+        ctx.img = ctx.step_output.prev_sample
+        if not ctx.is_scheduler_internal_step:
             ctx.user_step += 1
-            # Only call step_callback if we haven't exceeded total_steps
+            # Only update progress if we haven't exceeded total_steps
             # (LCM scheduler may have more internal steps than user-facing steps)
             if ctx.user_step <= ctx.total_steps:
                 pbar.update(1)
-                ctx.step_callback(
-                    PipelineIntermediateState(
-                        step=ctx.user_step,
-                        order=2 if is_heun else 1,
-                        total_steps=ctx.total_steps,
-                        timestep=int(ctx.t_curr * 1000),  # TODO: not used anywhere in code
-                        latents=step_output.pred_original_sample,
-                    ),
-                )
-
-        ctx.img = step_output.prev_sample
 
     pbar.close()
     return ctx.img

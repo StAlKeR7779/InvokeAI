@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from invokeai.backend.rectified_flow.rectified_flow_inpaint_extension import RectifiedFlowInpaintExtension
     from invokeai.backend.stable_diffusion.diffusers_pipeline import PipelineIntermediateState
     from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningMode, TextConditioningData
+    from invokeai.backend.flux.extensions.preview import PreviewExt
 
 
 # @dataclass
@@ -51,7 +52,6 @@ class DenoiseContext:
     # sampling parameters
     timesteps: list[float]
     scheduler: SchedulerMixin
-    step_callback: Callable[[PipelineIntermediateState], None]
     guidance: float
     cfg_scale: list[float]
     inpaint_extension: RectifiedFlowInpaintExtension | None
@@ -73,8 +73,12 @@ class DenoiseContext:
     step_index: int | None = None
     user_step: int | None = None
     total_steps: int | None = None
+    is_scheduler_internal_step: bool | None = None
     t_curr: float | None = None
     conditioning_mode: ConditioningMode | None = None
+    step_output: SchedulerOutput | None = None
+
+    preview_ext: PreviewExt | None = None
 
     # Dictionary for extensions to pass extra info about denoise process to other extensions.
     extra: dict = field(default_factory=dict)
