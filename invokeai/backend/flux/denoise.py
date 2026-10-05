@@ -109,9 +109,6 @@ def denoise_(
     # For user-facing step count, use the original number of denoising steps
     ctx.total_steps = len(ctx.timesteps) - 1
 
-    # guidance_vec is ignored for schnell.
-    ctx.guidance_vec = torch.full((ctx.img.shape[0],), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
-
     # DyPE: Patch model with DyPE-aware position embedder
     dype_embedder = None
     original_pe_embedder = None
@@ -128,21 +125,21 @@ def denoise_(
         for ctx.step_index in range(num_scheduler_steps):
             timestep = ctx.scheduler.timesteps[ctx.step_index]
             # Convert scheduler timestep (0-1000) to normalized (0-1) for the model
-            t_curr = timestep.item() / ctx.scheduler.config.num_train_timesteps
-            dype_sigma = DyPEExtension.resolve_step_sigma(
-                fallback_sigma=t_curr,
-                step_index=ctx.step_index,
-                scheduler_sigmas=getattr(ctx.scheduler, "sigmas", None),
-            )
+            ctx.t_curr = timestep.item() / ctx.scheduler.config.num_train_timesteps
 
+            # PRE_SAMPLER_STEP - DyPEExtension
             # DyPE: Update step state for timestep-dependent scaling
             if ctx.dype_extension is not None and dype_embedder is not None:
+                dype_sigma = DyPEExtension.resolve_step_sigma(
+                    fallback_sigma=ctx.t_curr,
+                    step_index=ctx.step_index,
+                    scheduler_sigmas=getattr(ctx.scheduler, "sigmas", None),
+                )
+
                 ctx.dype_extension.update_step_state(
                     embedder=dype_embedder,
                     sigma=dype_sigma,
                 )
-
-            ctx.t_vec = torch.full((ctx.img.shape[0],), t_curr, dtype=ctx.img.dtype, device=ctx.img.device)
 
             step_cfg_scale = ctx.cfg_scale[min(ctx.user_step, len(ctx.cfg_scale) - 1)]
             if math.isclose(step_cfg_scale, 1.0):
@@ -154,6 +151,7 @@ def denoise_(
             step_output = ctx.scheduler.step(model_output=pred, timestep=timestep, sample=ctx.img)
             ctx.img = step_output.prev_sample
 
+            # POST_SAMPLER_STEP -  RectifiedFlowInpaintExtension, PreviewExt(order=last)
             if ctx.inpaint_extension is not None:
                 # Get sigma_prev for inpainting (next sigma value)
                 if ctx.step_index + 1 < len(ctx.scheduler.sigmas):
@@ -171,7 +169,7 @@ def denoise_(
                 # (LCM scheduler may have more internal steps than user-facing steps)
                 if ctx.user_step <= ctx.total_steps:
                     pbar.update(1)
-                    preview_img = ctx.img - t_curr * pred
+                    preview_img = ctx.img - ctx.t_curr * pred
                     if ctx.inpaint_extension is not None:
                         preview_img = ctx.inpaint_extension.merge_intermediate_latents_with_init_latents(
                             preview_img, 0.0
@@ -181,7 +179,7 @@ def denoise_(
                             step=ctx.user_step,
                             order=2 if is_heun else 1,
                             total_steps=ctx.total_steps,
-                            timestep=int(t_curr * 1000),  # TODO: not used anywhere in code
+                            timestep=int(ctx.t_curr * 1000),  # TODO: not used anywhere in code
                             latents=preview_img,
                         ),
                     )
@@ -210,18 +208,20 @@ def guidance_cfg(ctx: DenoiseContext, step_cfg_scale: float) -> torch.Tensor:
     return pred
 
 
-def run_controlnets(ctx: DenoiseContext, conditioning_mode: ConditioningMode):
-    assert conditioning_mode != ConditioningMode.Both
-    if conditioning_mode == ConditioningMode.Positive:
+def run_controlnets(ctx: DenoiseContext):
+    assert ctx.conditioning_mode != ConditioningMode.Both
+    if ctx.conditioning_mode == ConditioningMode.Positive:
         regional_prompting_extension = ctx.pos_regional_prompting_extension
     else:
         regional_prompting_extension = ctx.neg_regional_prompting_extension
 
     # TODO:
-    if conditioning_mode != ConditioningMode.Positive:
+    if ctx.conditioning_mode != ConditioningMode.Positive:
         return None
 
     # Run ControlNet models.
+    t_vec = torch.full((ctx.img.shape[0],), ctx.t_curr, dtype=ctx.img.dtype, device=ctx.img.device)
+    guidance_vec = torch.full((ctx.img.shape[0],), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
     controlnet_residuals: list[ControlNetFluxOutput] = []
     for controlnet_extension in ctx.controlnet_extensions:
         controlnet_residuals.append(
@@ -233,8 +233,8 @@ def run_controlnets(ctx: DenoiseContext, conditioning_mode: ConditioningMode):
                 txt=regional_prompting_extension.regional_text_conditioning.t5_embeddings,
                 txt_ids=regional_prompting_extension.regional_text_conditioning.t5_txt_ids,
                 y=regional_prompting_extension.regional_text_conditioning.clip_embeddings,
-                timesteps=ctx.t_vec,
-                guidance=ctx.guidance_vec,
+                timesteps=t_vec,
+                guidance=guidance_vec,
             )
         )
 
@@ -255,8 +255,7 @@ def run_model(ctx: DenoiseContext, conditioning_mode: ConditioningMode):
         regional_prompting_extension = ctx.neg_regional_prompting_extension
         ip_adapter_extensions = ctx.neg_ip_adapter_extensions
 
-    # Run ControlNet models.
-    merged_controlnet_residuals = run_controlnets(ctx, conditioning_mode)
+    ctx.conditioning_mode = conditioning_mode
 
     # Store original sequence length for slicing predictions
     original_seq_len = ctx.img.shape[1]
@@ -277,20 +276,26 @@ def run_model(ctx: DenoiseContext, conditioning_mode: ConditioningMode):
         img_input = torch.cat((img_input, ctx.img_cond_seq), dim=1)
         img_input_ids = torch.cat((img_input_ids, ctx.img_cond_seq_ids), dim=1)
 
+    # PRE_MODEL_RUN - XLabsControlNetExtension | InstantXControlNetExtension
+    # Run ControlNet models.
+    merged_controlnet_residuals = run_controlnets(ctx)
+
     controlnet_double_block_residuals = None
     controlnet_single_block_residuals = None
     if (merged_controlnet_residuals != None):
         controlnet_double_block_residuals = merged_controlnet_residuals.double_block_residuals
         controlnet_single_block_residuals = merged_controlnet_residuals.single_block_residuals
 
+    t_vec = torch.full((ctx.img.shape[0],), ctx.t_curr, dtype=ctx.img.dtype, device=ctx.img.device)
+    guidance_vec = torch.full((ctx.img.shape[0],), ctx.guidance, device=ctx.img.device, dtype=ctx.img.dtype)
     pred = ctx.model(
         img=img_input,
         img_ids=img_input_ids,
         txt=regional_prompting_extension.regional_text_conditioning.t5_embeddings,
         txt_ids=regional_prompting_extension.regional_text_conditioning.t5_txt_ids,
         y=regional_prompting_extension.regional_text_conditioning.clip_embeddings,
-        timesteps=ctx.t_vec,
-        guidance=ctx.guidance_vec,
+        timesteps=t_vec,
+        guidance=guidance_vec,
         timestep_index=ctx.user_step,  # TODO:
         total_num_timesteps=ctx.total_steps,
         controlnet_double_block_residuals=controlnet_double_block_residuals,
@@ -302,5 +307,7 @@ def run_model(ctx: DenoiseContext, conditioning_mode: ConditioningMode):
     # Slice prediction to only include the main image tokens
     if ctx.img_cond_seq is not None:
         pred = pred[:, :original_seq_len]
+
+    ctx.conditioning_mode = None
 
     return pred

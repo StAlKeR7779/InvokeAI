@@ -73,8 +73,8 @@ class DenoiseContext:
     step_index: int | None = None
     user_step: int | None = None
     total_steps: int | None = None
-    t_vec: torch.Tensor | None = None
-    guidance_vec: torch.Tensor | None = None
+    t_curr: float | None = None
+    conditioning_mode: ConditioningMode | None = None
 
     # Dictionary for extensions to pass extra info about denoise process to other extensions.
     extra: dict = field(default_factory=dict)
